@@ -22,26 +22,81 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         if (!sid || !aid) return next();
 
         const t0 = Date.now();
+        const rid = String(t0);
+        const path = (req as any).originalUrl || req.url;
+        const key = normalizeRouteKey(req.method, path);
+
+        // Capture response body
+        let capturedBody: any = undefined;
+
+        const origJson = res.json.bind(res as any);
+        (res as any).json = (body: any) => {
+            capturedBody = body;
+            return origJson(body);
+        };
+
+        const origSend = res.send.bind(res as any);
+        (res as any).send = (body: any) => {
+            if (capturedBody === undefined) {
+                capturedBody = coerceBodyToStorable(body, res.getHeader?.('content-type'));
+            }
+            return origSend(body);
+        };
+
         als.run({ sid, aid }, () => {
             res.on('finish', () => {
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
                         request: {
-                            rid: String(t0),
+                            rid,
                             method: req.method,
-                            path: (req as any).originalUrl || req.url,
+                            path,                      // kept for backward compat
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: {}
+                            headers: {},               // keep as-is (fill if you want)
+                            key,                       // NEW: e.g. "GET /items"
+                            respBody: capturedBody,    // NEW: JSON if parseable, else string
                         },
-                        t: Date.now()
+                        t: Date.now(),
                     }]
                 });
             });
             next();
         });
     };
+}
+
+function normalizeRouteKey(method: string, rawPath: string) {
+    // strip query string to stabilize grouping across re-loads
+    const base = rawPath.split('?')[0] || '/';
+    return `${method.toUpperCase()} ${base}`;
+}
+
+function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
+    // If already an object/array, store as-is
+    if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
+
+    // Try to parse JSON for common cases
+    const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
+    const isLikelyJson = ct.toLowerCase().includes('application/json');
+
+    try {
+        if (Buffer.isBuffer(body)) {
+            const s = body.toString('utf8');
+            return isLikelyJson ? JSON.parse(s) : s;
+        }
+        if (typeof body === 'string') {
+            return isLikelyJson ? JSON.parse(body) : body;
+        }
+    } catch (_) {
+        // fallthrough to raw string if JSON parse fails
+        if (Buffer.isBuffer(body)) return body.toString('utf8');
+        if (typeof body === 'string') return body;
+    }
+
+    // last resort
+    return body;
 }
 
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
