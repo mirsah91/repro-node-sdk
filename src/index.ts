@@ -12,23 +12,58 @@ async function post(apiBase: string, appId: string, appSecret: string, sessionId
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-App-Id': appId, 'X-App-Secret': appSecret },
             body: JSON.stringify(body),
-        }); } catch {}
+        });
+    } catch { /* swallow in SDK */ }
 }
 
+// -------- helpers for response capture & grouping --------
+function normalizeRouteKey(method: string, rawPath: string) {
+    // strip query string to stabilize grouping across re-loads
+    const base = (rawPath || '/').split('?')[0] || '/';
+    return `${String(method || 'GET').toUpperCase()} ${base}`;
+}
+
+function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
+    // If already an object/array, store as-is
+    if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
+
+    const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
+    const isLikelyJson = ct.toLowerCase().includes('application/json');
+
+    try {
+        if (Buffer.isBuffer(body)) {
+            const s = body.toString('utf8');
+            return isLikelyJson ? JSON.parse(s) : s;
+        }
+        if (typeof body === 'string') {
+            return isLikelyJson ? JSON.parse(body) : body;
+        }
+    } catch {
+        // fall through to raw string if JSON parse fails
+        if (Buffer.isBuffer(body)) return body.toString('utf8');
+        if (typeof body === 'string') return body;
+    }
+    // last resort
+    return body;
+}
+
+// ===================================================================
+// reproMiddleware — now captures respBody (+ key) and posts both url & path
+// ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
-        if (!sid || !aid) return next();
+        if (!sid || !aid) return next(); // only capture tagged requests
 
         const t0 = Date.now();
         const rid = String(t0);
-        const path = (req as any).originalUrl || req.url;
-        const key = normalizeRouteKey(req.method, path);
+        const url = (req as any).originalUrl || req.url || '/'; // send as 'url'
+        const path = url;                                       // keep 'path' for back-compat
+        const key = normalizeRouteKey(req.method, url);
 
-        // Capture response body
+        // ---- Capture response body robustly (json/send/write/end) ----
         let capturedBody: any = undefined;
-
         const origJson = res.json.bind(res as any);
         (res as any).json = (body: any) => {
             capturedBody = body;
@@ -43,18 +78,41 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             return origSend(body);
         };
 
+        // If the handler uses res.write/res.end directly, accumulate chunks
+        const origWrite = (res as any).write.bind(res as any);
+        const origEnd = (res as any).end.bind(res as any);
+        const chunks: Array<Buffer | string> = [];
+
+        (res as any).write = (chunk: any, ...args: any[]) => {
+            try { if (chunk != null) chunks.push(chunk); } catch {}
+            return origWrite(chunk, ...args);
+        };
+        (res as any).end = (chunk?: any, ...args: any[]) => {
+            try { if (chunk != null) chunks.push(chunk); } catch {}
+            return origEnd(chunk, ...args);
+        };
+
         als.run({ sid, aid }, () => {
             res.on('finish', () => {
+                // If nothing captured via json/send, try assembled chunks
+                if (capturedBody === undefined && chunks.length) {
+                    const buf = Buffer.isBuffer(chunks[0])
+                        ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
+                        : Buffer.from(chunks.map(String).join(''));
+                    capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
+                }
+
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
                         request: {
                             rid,
                             method: req.method,
+                            url,                       // NEW: explicit url (API stores this)
                             path,                      // kept for backward compat
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: {},               // keep as-is (fill if you want)
+                            headers: {},               // (optional) sanitize & include if desired
                             key,                       // NEW: e.g. "GET /items"
                             respBody: capturedBody,    // NEW: JSON if parseable, else string
                         },
@@ -67,38 +125,9 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
     };
 }
 
-function normalizeRouteKey(method: string, rawPath: string) {
-    // strip query string to stabilize grouping across re-loads
-    const base = rawPath.split('?')[0] || '/';
-    return `${method.toUpperCase()} ${base}`;
-}
-
-function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
-    // If already an object/array, store as-is
-    if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
-
-    // Try to parse JSON for common cases
-    const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
-    const isLikelyJson = ct.toLowerCase().includes('application/json');
-
-    try {
-        if (Buffer.isBuffer(body)) {
-            const s = body.toString('utf8');
-            return isLikelyJson ? JSON.parse(s) : s;
-        }
-        if (typeof body === 'string') {
-            return isLikelyJson ? JSON.parse(body) : body;
-        }
-    } catch (_) {
-        // fallthrough to raw string if JSON parse fails
-        if (Buffer.isBuffer(body)) return body.toString('utf8');
-        if (typeof body === 'string') return body;
-    }
-
-    // last resort
-    return body;
-}
-
+// ===================================================================
+// reproMongoosePlugin — unchanged logic, light polish
+// ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
         // PRE: save
@@ -140,7 +169,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-
+        // PRE: findOneAndUpdate — capture "before"
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
@@ -153,6 +182,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
+        // POST: findOneAndUpdate — emit change
         schema.post<Query<any, any>>('findOneAndUpdate', function (res: any) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
@@ -164,14 +194,19 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx().sid as string), {
                 entries: [{
                     actionId: aid!,
-                    db: [{ collection, pk: { _id: pk }, before, after, op: after && before ? 'update' : after ? 'insert' : 'update' }],
+                    db: [{
+                        collection,
+                        pk: { _id: pk },
+                        before,
+                        after,
+                        op: after && before ? 'update' : after ? 'insert' : 'update',
+                    }],
                     t: Date.now()
                 }]
             });
         });
 
-
-        // deleteOne (correct options + getFilter + Query typing)
+        // PRE: deleteOne — capture "before"
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
@@ -183,6 +218,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
+        // POST: deleteOne — emit delete
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
