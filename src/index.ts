@@ -7,14 +7,35 @@ const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
 function getCollectionNameFromDoc(doc: any): string | undefined {
-    // Most reliable first
-    return (
-        doc?.$__?.collection?.collectionName ||          // internal collection holder
-        (doc?.$collection as any)?.collectionName ||      // alt internal on some versions
-        doc?.collection?.collectionName ||                // public API
-        (doc?.collection as any)?.name ||                 // old fallback
-        (doc?.constructor as any)?.collection?.collectionName // via model constructor
-    );
+    // Prefer internal collection (Mongoose 8)
+    const direct =
+        doc?.$__?.collection?.collectionName ||
+        (doc?.$collection as any)?.collectionName ||
+        doc?.collection?.collectionName ||
+        (doc?.collection as any)?.name ||
+        (doc?.constructor as any)?.collection?.collectionName;
+
+    if (direct) return direct;
+
+    // Subdocument? Try ownerDocument()
+    if (doc?.$isSubdocument && typeof doc.ownerDocument === 'function') {
+        const parent = doc.ownerDocument();
+        return (
+            parent?.$__?.collection?.collectionName ||
+            (parent?.$collection as any)?.collectionName ||
+            parent?.collection?.collectionName ||
+            (parent?.collection as any)?.name ||
+            (parent?.constructor as any)?.collection?.collectionName
+        );
+    }
+
+    // Discriminator child may have baseModelName
+    const ctor = doc?.constructor as any;
+    if (ctor?.base && ctor?.base?.collection?.collectionName) {
+        return ctor.base.collection.collectionName;
+    }
+
+    return undefined;
 }
 
 function getCollectionNameFromQuery(q: any): string | undefined {
@@ -24,17 +45,19 @@ function getCollectionNameFromQuery(q: any): string | undefined {
     );
 }
 
-function resolveCollectionOrWarn(source: any, type: 'doc'|'query'): string {
+function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
     const name =
-        (type === 'doc' ? getCollectionNameFromDoc(source) : getCollectionNameFromQuery(source))
-        || undefined;
+        (type === 'doc'
+            ? getCollectionNameFromDoc(source)
+            : getCollectionNameFromQuery(source)) || undefined;
 
     if (!name) {
-        // Optional: emit a low-noise console.warn once to help trace edge models
         try {
-            const modelName = type === 'doc'
-                ? (source?.constructor as any)?.modelName
-                : source?.model?.modelName;
+            const modelName =
+                type === 'doc'
+                    ? (source?.constructor as any)?.modelName ||
+                    (source?.ownerDocument?.() as any)?.constructor?.modelName
+                    : source?.model?.modelName;
             // eslint-disable-next-line no-console
             console.warn('[repro] could not resolve collection name', { type, modelName });
         } catch {}
@@ -167,10 +190,13 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
-        // PRE: save — capture before + collection safely
+        // PRE: save
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
+
+            // Skip embedded subdocuments — they don't have their own collection
+            if ((this as any).$isSubdocument) return next();
 
             let before: any = null;
             try {
@@ -188,10 +214,13 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
-        // POST: save — use cached before + robust collection name
+        // POST: save
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
+            // Skip embedded subdocuments
+            if ((this as any).$isSubdocument) return;
 
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
@@ -212,6 +241,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 }]
             });
         });
+
 
         // PRE: findOneAndUpdate — capture "before"
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
