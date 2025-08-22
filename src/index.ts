@@ -6,12 +6,41 @@ type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
-function getCollectionNameFromDoc(doc: any): string {
-    const ctor = (doc?.constructor as any) || {};
-    return ctor?.collection?.collectionName
-        ?? doc?.collection?.collectionName
-        ?? (doc?.collection as any)?.name
-        ?? 'unknown';
+function getCollectionNameFromDoc(doc: any): string | undefined {
+    // Most reliable first
+    return (
+        doc?.$__?.collection?.collectionName ||          // internal collection holder
+        (doc?.$collection as any)?.collectionName ||      // alt internal on some versions
+        doc?.collection?.collectionName ||                // public API
+        (doc?.collection as any)?.name ||                 // old fallback
+        (doc?.constructor as any)?.collection?.collectionName // via model constructor
+    );
+}
+
+function getCollectionNameFromQuery(q: any): string | undefined {
+    return (
+        q?.model?.collection?.collectionName ||
+        (q?.model?.collection as any)?.name
+    );
+}
+
+function resolveCollectionOrWarn(source: any, type: 'doc'|'query'): string {
+    const name =
+        (type === 'doc' ? getCollectionNameFromDoc(source) : getCollectionNameFromQuery(source))
+        || undefined;
+
+    if (!name) {
+        // Optional: emit a low-noise console.warn once to help trace edge models
+        try {
+            const modelName = type === 'doc'
+                ? (source?.constructor as any)?.modelName
+                : source?.model?.modelName;
+            // eslint-disable-next-line no-console
+            console.warn('[repro] could not resolve collection name', { type, modelName });
+        } catch {}
+        return 'unknown';
+    }
+    return name;
 }
 
 async function post(apiBase: string, appId: string, appSecret: string, sessionId: string, body: any) {
@@ -143,24 +172,19 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
 
-            const model = this.constructor as Model<any>;
             let before: any = null;
-
             try {
                 if (!this.isNew) {
-                    // read previous snapshot
+                    const model = this.constructor as Model<any>;
                     before = await model.findById(this._id).lean().exec();
                 }
-            } catch {
-                // swallow — best-effort capture
-            }
+            } catch {}
 
             (this as any).__repro_meta = {
                 wasNew: this.isNew,
                 before,
-                collection: getCollectionNameFromDoc(this),
+                collection: resolveCollectionOrWarn(this, 'doc'),
             };
-
             next();
         });
 
@@ -172,8 +196,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
-
-            const collection = meta.collection || getCollectionNameFromDoc(this);
+            const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
@@ -199,6 +222,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 const model = this.model as Model<any>;
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
                 this.setOptions({ new: true });
+                (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
             } catch {}
             next();
         });
@@ -207,12 +231,15 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.post<Query<any, any>>('findOneAndUpdate', function (res: any) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
-            const collection = this.model.collection.name;
+            const collection =
+                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx().sid as string), {
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
                     db: [{
@@ -235,22 +262,31 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 const filter = this.getFilter();
                 const model = this.model as Model<any>;
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
+                (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
             } catch {}
             next();
         });
 
-        // POST: deleteOne — emit delete
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
 
-            const collection = this.model.collection.name;
+            const collection =
+                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
-                    db: [{ collection, pk: { _id: before._id }, before, after: null, op: 'delete' }],
+                    db: [{
+                        collection,
+                        pk: { _id: before._id },
+                        before,
+                        after: null,
+                        op: 'delete',
+                    }],
                     t: Date.now()
                 }]
             });
