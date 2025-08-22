@@ -6,6 +6,14 @@ type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
+function getCollectionNameFromDoc(doc: any): string {
+    const ctor = (doc?.constructor as any) || {};
+    return ctor?.collection?.collectionName
+        ?? doc?.collection?.collectionName
+        ?? (doc?.collection as any)?.name
+        ?? 'unknown';
+}
+
 async function post(apiBase: string, appId: string, appSecret: string, sessionId: string, body: any) {
     try {
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
@@ -130,29 +138,42 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
-        // PRE: save
+        // PRE: save — capture before + collection safely
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
+
+            const model = this.constructor as Model<any>;
+            let before: any = null;
+
             try {
-                const model = this.constructor as Model<any>;
-                (this as any).__repro_meta = {
-                    wasNew: this.isNew,
-                    before: this.isNew ? null : await model.findById(this._id).lean().exec(),
-                    collection: (this as any).collection.name,
-                };
-            } catch {}
+                if (!this.isNew) {
+                    // read previous snapshot
+                    before = await model.findById(this._id).lean().exec();
+                }
+            } catch {
+                // swallow — best-effort capture
+            }
+
+            (this as any).__repro_meta = {
+                wasNew: this.isNew,
+                before,
+                collection: getCollectionNameFromDoc(this),
+            };
+
             next();
         });
 
-        // POST: save
+        // POST: save — use cached before + robust collection name
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
-            const collection = meta.collection || (this as any).collection.name;
+
+            const collection = meta.collection || getCollectionNameFromDoc(this);
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
