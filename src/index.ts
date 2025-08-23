@@ -1,7 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import type { Schema, Model, Query } from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
-export { patchSendgridMail } from './integrations/sendgrid';
 
 type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
@@ -323,4 +322,133 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
     };
+}
+
+export type SendgridPatchConfig = {
+    appId: string;
+    appSecret: string;
+    apiBase: string;
+    resolveContext?: () => { sid?: string; aid?: string } | undefined;
+};
+
+export function patchSendgridMail(cfg: SendgridPatchConfig) {
+    let sgMail: any;
+    try { sgMail = require('@sendgrid/mail'); } catch { return; } // no-op if not installed
+
+    if (!sgMail || (sgMail as any).__repro_patched) return;
+    (sgMail as any).__repro_patched = true;
+
+    const origSend = sgMail.send?.bind(sgMail);
+    const origSendMultiple = sgMail.sendMultiple?.bind(sgMail);
+
+    if (origSend) {
+        sgMail.send = async function patchedSend(msg: any, isMultiple?: boolean) {
+            const t0 = Date.now();
+            let statusCode: number | undefined;
+            let headers: Record<string, any> | undefined;
+            try {
+                const res = await origSend(msg, isMultiple);
+                const r = Array.isArray(res) ? res[0] : res;
+                statusCode = r?.statusCode ?? r?.status;
+                headers = r?.headers ?? undefined;
+                return res;
+            } finally {
+                fireCapture('send', msg, t0, statusCode, headers);
+            }
+        };
+    }
+
+    if (origSendMultiple) {
+        sgMail.sendMultiple = async function patchedSendMultiple(msg: any) {
+            const t0 = Date.now();
+            let statusCode: number | undefined;
+            let headers: Record<string, any> | undefined;
+            try {
+                const res = await origSendMultiple(msg);
+                const r = Array.isArray(res) ? res[0] : res;
+                statusCode = r?.statusCode ?? r?.status;
+                headers = r?.headers ?? undefined;
+                return res;
+            } finally {
+                fireCapture('sendMultiple', msg, t0, statusCode, headers);
+            }
+        };
+    }
+
+    function fireCapture(kind: 'send' | 'sendMultiple', rawMsg: any, t0: number, statusCode?: number, headers?: any) {
+        const ctx = getCtx();
+        const sid = ctx.sid ?? cfg.resolveContext?.()?.sid;
+        const aid = ctx.aid ?? cfg.resolveContext?.()?.aid;
+        if (!sid) return;
+
+        const norm = normalizeSendgridMessage(rawMsg);
+        post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+            entries: [{
+                actionId: aid ?? null,
+                email: {
+                    provider: 'sendgrid',
+                    kind,
+                    to: norm.to, cc: norm.cc, bcc: norm.bcc, from: norm.from,
+                    subject: norm.subject, text: norm.text, html: norm.html,
+                    templateId: norm.templateId, dynamicTemplateData: norm.dynamicTemplateData,
+                    categories: norm.categories, customArgs: norm.customArgs,
+                    attachmentsMeta: norm.attachmentsMeta,
+                    statusCode, durMs: Date.now() - t0, headers: headers ?? {},
+                },
+                t: Date.now(),
+            }]
+        });
+    }
+
+    function normalizeAddress(a: any): { email: string; name?: string } | null {
+        if (!a) return null;
+        if (typeof a === 'string') return { email: a };
+        if (typeof a === 'object' && a.email) return { email: String(a.email), name: a.name ? String(a.name) : undefined };
+        return null;
+    }
+    function normalizeAddressList(v: any) {
+        if (!v) return undefined;
+        const arr = Array.isArray(v) ? v : [v];
+        const out = arr.map(normalizeAddress).filter(Boolean) as Array<{ email: string; name?: string }>;
+        return out.length ? out : undefined;
+    }
+    function normalizeSendgridMessage(msg: any) {
+        const base = {
+            from: normalizeAddress(msg?.from) ?? undefined,
+            to: normalizeAddressList(msg?.to),
+            cc: normalizeAddressList(msg?.cc),
+            bcc: normalizeAddressList(msg?.bcc),
+            subject: msg?.subject ? String(msg.subject) : undefined,
+            text: typeof msg?.text === 'string' ? msg.text : undefined,
+            html: typeof msg?.html === 'string' ? msg.html : undefined,
+            templateId: msg?.templateId ? String(msg.templateId) : undefined,
+            dynamicTemplateData: msg?.dynamic_template_data ?? msg?.dynamicTemplateData ?? undefined,
+            categories: Array.isArray(msg?.categories) ? msg.categories.map(String) : undefined,
+            customArgs: msg?.customArgs ?? msg?.custom_args ?? undefined,
+            attachmentsMeta: Array.isArray(msg?.attachments)
+                ? msg.attachments.map((a: any) => ({
+                    filename: a?.filename ? String(a.filename) : undefined,
+                    type: a?.type ? String(a.type) : undefined,
+                    size: a?.content ? byteLen(a.content) : undefined,
+                }))
+                : undefined,
+        };
+        const p0 = Array.isArray(msg?.personalizations) ? msg.personalizations[0] : undefined;
+        if (p0) {
+            base.to = normalizeAddressList(p0.to) ?? base.to;
+            base.cc = normalizeAddressList(p0.cc) ?? base.cc;
+            base.bcc = normalizeAddressList(p0.bcc) ?? base.bcc;
+            if (!base.subject && p0.subject) base.subject = String(p0.subject);
+            if (!base.dynamicTemplateData && p0.dynamic_template_data) base.dynamicTemplateData = p0.dynamic_template_data;
+            if (!base.customArgs && p0.custom_args) base.customArgs = p0.custom_args;
+        }
+        return base;
+    }
+    function byteLen(content: any): number | undefined {
+        try {
+            if (typeof content === 'string') return Buffer.byteLength(content, 'utf8');
+            if (content && typeof content === 'object' && 'length' in content) return Number((content as any).length);
+        } catch {}
+        return undefined;
+    }
 }
