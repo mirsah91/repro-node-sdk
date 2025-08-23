@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import type { Schema, Model, Query } from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
+export { patchSendgridMail } from './integrations/sendgrid';
 
 type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
