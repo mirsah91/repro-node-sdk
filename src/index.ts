@@ -219,14 +219,24 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
-
-            // Skip embedded subdocuments
             if ((this as any).$isSubdocument) return;
 
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
+
+            // NEW: synthesize query for save()
+            let query: any;
+            if (meta.wasNew) {
+                query = { op: 'insertOne', doc: after };
+            } else {
+                query = {
+                    filter: { _id: this._id },
+                    update: buildMinimalUpdate(before, after),
+                    options: { upsert: false },
+                };
+            }
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
@@ -237,6 +247,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         before,
                         after,
                         op: meta.wasNew ? 'insert' : 'update',
+                        query,                 // <-- add query here
                     }],
                     t: Date.now(),
                 }]
@@ -284,29 +295,25 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-        // PRE: deleteOne — capture "before"
+        // PRE: deleteOne
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
-            const { sid, aid } = getCtx();
-            if (!sid || !aid) return next();
+            const { sid, aid } = getCtx(); if (!sid || !aid) return next();
             try {
                 const filter = this.getFilter();
-                const model = this.model as Model<any>;
-                (this as any).__repro_before = await model.findOne(filter).lean().exec();
+                (this as any).__repro_before = await (this.model as Model<any>).findOne(filter).lean().exec();
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
+                (this as any).__repro_filter = filter; // <-- keep filter
             } catch {}
             next();
         });
 
+        // POST: deleteOne
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
-            const { sid, aid } = getCtx();
-            if (!sid || !aid) return;
-
+            const { sid, aid } = getCtx(); if (!sid || !aid) return;
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
-
-            const collection =
-                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-
+            const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+            const filter = (this as any).__repro_filter ?? { _id: before._id }; // fallback
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
@@ -316,6 +323,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         before,
                         after: null,
                         op: 'delete',
+                        query: { filter },     // <-- add query
                     }],
                     t: Date.now()
                 }]
@@ -497,6 +505,38 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     });
 }
 
+function buildMinimalUpdate(before: any, after: any) {
+    const set: Record<string, any> = {};
+    const unset: Record<string, any> = {};
+
+    function walk(b: any, a: any, path = '') {
+        const bKeys = b ? Object.keys(b) : [];
+        const aKeys = a ? Object.keys(a) : [];
+        const all = new Set([...bKeys, ...aKeys]);
+        for (const k of all) {
+            const p = path ? `${path}.${k}` : k;
+            const bv = b?.[k];
+            const av = a?.[k];
+            const bothObj = bv && av && typeof bv === 'object' && typeof av === 'object' &&
+                !Array.isArray(bv) && !Array.isArray(av);
+            if (bothObj) {
+                walk(bv, av, p);
+            } else if (typeof av === 'undefined') {
+                unset[p] = '';
+            } else if (JSON.stringify(bv) !== JSON.stringify(av)) {
+                set[p] = av;
+            }
+        }
+    }
+
+    walk(before || {}, after || {});
+    const update: any = {};
+    if (Object.keys(set).length) update.$set = set;
+    if (Object.keys(unset).length) update.$unset = unset;
+    return update;
+}
+
+// Sendgrid
 export type SendgridPatchConfig = {
     appId: string;
     appSecret: string;
@@ -625,3 +665,4 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         return undefined;
     }
 }
+
