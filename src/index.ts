@@ -6,6 +6,66 @@ type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
+function getCollectionNameFromDoc(doc: any): string | undefined {
+    // Prefer internal collection (Mongoose 8)
+    const direct =
+        doc?.$__?.collection?.collectionName ||
+        (doc?.$collection as any)?.collectionName ||
+        doc?.collection?.collectionName ||
+        (doc?.collection as any)?.name ||
+        (doc?.constructor as any)?.collection?.collectionName;
+
+    if (direct) return direct;
+
+    // Subdocument? Try ownerDocument()
+    if (doc?.$isSubdocument && typeof doc.ownerDocument === 'function') {
+        const parent = doc.ownerDocument();
+        return (
+            parent?.$__?.collection?.collectionName ||
+            (parent?.$collection as any)?.collectionName ||
+            parent?.collection?.collectionName ||
+            (parent?.collection as any)?.name ||
+            (parent?.constructor as any)?.collection?.collectionName
+        );
+    }
+
+    // Discriminator child may have baseModelName
+    const ctor = doc?.constructor as any;
+    if (ctor?.base && ctor?.base?.collection?.collectionName) {
+        return ctor.base.collection.collectionName;
+    }
+
+    return undefined;
+}
+
+function getCollectionNameFromQuery(q: any): string | undefined {
+    return (
+        q?.model?.collection?.collectionName ||
+        (q?.model?.collection as any)?.name
+    );
+}
+
+function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
+    const name =
+        (type === 'doc'
+            ? getCollectionNameFromDoc(source)
+            : getCollectionNameFromQuery(source)) || undefined;
+
+    if (!name) {
+        try {
+            const modelName =
+                type === 'doc'
+                    ? (source?.constructor as any)?.modelName ||
+                    (source?.ownerDocument?.() as any)?.constructor?.modelName
+                    : source?.model?.modelName;
+            // eslint-disable-next-line no-console
+            console.warn('[repro] could not resolve collection name', { type, modelName });
+        } catch {}
+        return 'unknown';
+    }
+    return name;
+}
+
 async function post(apiBase: string, appId: string, appSecret: string, sessionId: string, body: any) {
     try {
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
@@ -134,14 +194,23 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
+
+            // Skip embedded subdocuments — they don't have their own collection
+            if ((this as any).$isSubdocument) return next();
+
+            let before: any = null;
             try {
-                const model = this.constructor as Model<any>;
-                (this as any).__repro_meta = {
-                    wasNew: this.isNew,
-                    before: this.isNew ? null : await model.findById(this._id).lean().exec(),
-                    collection: (this as any).collection.name,
-                };
+                if (!this.isNew) {
+                    const model = this.constructor as Model<any>;
+                    before = await model.findById(this._id).lean().exec();
+                }
             } catch {}
+
+            (this as any).__repro_meta = {
+                wasNew: this.isNew,
+                before,
+                collection: resolveCollectionOrWarn(this, 'doc'),
+            };
             next();
         });
 
@@ -149,10 +218,14 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
+            // Skip embedded subdocuments
+            if ((this as any).$isSubdocument) return;
+
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
-            const collection = meta.collection || (this as any).collection.name;
+            const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
@@ -169,6 +242,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
+
         // PRE: findOneAndUpdate — capture "before"
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
             const { sid, aid } = getCtx();
@@ -178,6 +252,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 const model = this.model as Model<any>;
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
                 this.setOptions({ new: true });
+                (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
             } catch {}
             next();
         });
@@ -186,12 +261,15 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.post<Query<any, any>>('findOneAndUpdate', function (res: any) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
-            const collection = this.model.collection.name;
+            const collection =
+                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx().sid as string), {
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
                     db: [{
@@ -214,25 +292,163 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 const filter = this.getFilter();
                 const model = this.model as Model<any>;
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
+                (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
             } catch {}
             next();
         });
 
-        // POST: deleteOne — emit delete
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
+
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
 
-            const collection = this.model.collection.name;
+            const collection =
+                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
-                    db: [{ collection, pk: { _id: before._id }, before, after: null, op: 'delete' }],
+                    db: [{
+                        collection,
+                        pk: { _id: before._id },
+                        before,
+                        after: null,
+                        op: 'delete',
+                    }],
                     t: Date.now()
                 }]
             });
         });
     };
+}
+
+export type SendgridPatchConfig = {
+    appId: string;
+    appSecret: string;
+    apiBase: string;
+    resolveContext?: () => { sid?: string; aid?: string } | undefined;
+};
+
+export function patchSendgridMail(cfg: SendgridPatchConfig) {
+    let sgMail: any;
+    try { sgMail = require('@sendgrid/mail'); } catch { return; } // no-op if not installed
+
+    if (!sgMail || (sgMail as any).__repro_patched) return;
+    (sgMail as any).__repro_patched = true;
+
+    const origSend = sgMail.send?.bind(sgMail);
+    const origSendMultiple = sgMail.sendMultiple?.bind(sgMail);
+
+    if (origSend) {
+        sgMail.send = async function patchedSend(msg: any, isMultiple?: boolean) {
+            const t0 = Date.now();
+            let statusCode: number | undefined;
+            let headers: Record<string, any> | undefined;
+            try {
+                const res = await origSend(msg, isMultiple);
+                const r = Array.isArray(res) ? res[0] : res;
+                statusCode = r?.statusCode ?? r?.status;
+                headers = r?.headers ?? undefined;
+                return res;
+            } finally {
+                fireCapture('send', msg, t0, statusCode, headers);
+            }
+        };
+    }
+
+    if (origSendMultiple) {
+        sgMail.sendMultiple = async function patchedSendMultiple(msg: any) {
+            const t0 = Date.now();
+            let statusCode: number | undefined;
+            let headers: Record<string, any> | undefined;
+            try {
+                const res = await origSendMultiple(msg);
+                const r = Array.isArray(res) ? res[0] : res;
+                statusCode = r?.statusCode ?? r?.status;
+                headers = r?.headers ?? undefined;
+                return res;
+            } finally {
+                fireCapture('sendMultiple', msg, t0, statusCode, headers);
+            }
+        };
+    }
+
+    function fireCapture(kind: 'send' | 'sendMultiple', rawMsg: any, t0: number, statusCode?: number, headers?: any) {
+        const ctx = getCtx();
+        const sid = ctx.sid ?? cfg.resolveContext?.()?.sid;
+        const aid = ctx.aid ?? cfg.resolveContext?.()?.aid;
+        if (!sid) return;
+
+        const norm = normalizeSendgridMessage(rawMsg);
+        post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+            entries: [{
+                actionId: aid ?? null,
+                email: {
+                    provider: 'sendgrid',
+                    kind,
+                    to: norm.to, cc: norm.cc, bcc: norm.bcc, from: norm.from,
+                    subject: norm.subject, text: norm.text, html: norm.html,
+                    templateId: norm.templateId, dynamicTemplateData: norm.dynamicTemplateData,
+                    categories: norm.categories, customArgs: norm.customArgs,
+                    attachmentsMeta: norm.attachmentsMeta,
+                    statusCode, durMs: Date.now() - t0, headers: headers ?? {},
+                },
+                t: Date.now(),
+            }]
+        });
+    }
+
+    function normalizeAddress(a: any): { email: string; name?: string } | null {
+        if (!a) return null;
+        if (typeof a === 'string') return { email: a };
+        if (typeof a === 'object' && a.email) return { email: String(a.email), name: a.name ? String(a.name) : undefined };
+        return null;
+    }
+    function normalizeAddressList(v: any) {
+        if (!v) return undefined;
+        const arr = Array.isArray(v) ? v : [v];
+        const out = arr.map(normalizeAddress).filter(Boolean) as Array<{ email: string; name?: string }>;
+        return out.length ? out : undefined;
+    }
+    function normalizeSendgridMessage(msg: any) {
+        const base = {
+            from: normalizeAddress(msg?.from) ?? undefined,
+            to: normalizeAddressList(msg?.to),
+            cc: normalizeAddressList(msg?.cc),
+            bcc: normalizeAddressList(msg?.bcc),
+            subject: msg?.subject ? String(msg.subject) : undefined,
+            text: typeof msg?.text === 'string' ? msg.text : undefined,
+            html: typeof msg?.html === 'string' ? msg.html : undefined,
+            templateId: msg?.templateId ? String(msg.templateId) : undefined,
+            dynamicTemplateData: msg?.dynamic_template_data ?? msg?.dynamicTemplateData ?? undefined,
+            categories: Array.isArray(msg?.categories) ? msg.categories.map(String) : undefined,
+            customArgs: msg?.customArgs ?? msg?.custom_args ?? undefined,
+            attachmentsMeta: Array.isArray(msg?.attachments)
+                ? msg.attachments.map((a: any) => ({
+                    filename: a?.filename ? String(a.filename) : undefined,
+                    type: a?.type ? String(a.type) : undefined,
+                    size: a?.content ? byteLen(a.content) : undefined,
+                }))
+                : undefined,
+        };
+        const p0 = Array.isArray(msg?.personalizations) ? msg.personalizations[0] : undefined;
+        if (p0) {
+            base.to = normalizeAddressList(p0.to) ?? base.to;
+            base.cc = normalizeAddressList(p0.cc) ?? base.cc;
+            base.bcc = normalizeAddressList(p0.bcc) ?? base.bcc;
+            if (!base.subject && p0.subject) base.subject = String(p0.subject);
+            if (!base.dynamicTemplateData && p0.dynamic_template_data) base.dynamicTemplateData = p0.dynamic_template_data;
+            if (!base.customArgs && p0.custom_args) base.customArgs = p0.custom_args;
+        }
+        return base;
+    }
+    function byteLen(content: any): number | undefined {
+        try {
+            if (typeof content === 'string') return Buffer.byteLength(content, 'utf8');
+            if (content && typeof content === 'object' && 'length' in content) return Number((content as any).length);
+        } catch {}
+        return undefined;
+    }
 }
