@@ -226,17 +226,10 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
 
-            // NEW: synthesize query for save()
-            let query: any;
-            if (meta.wasNew) {
-                query = { op: 'insertOne', doc: after };
-            } else {
-                query = {
-                    filter: { _id: this._id },
-                    update: buildMinimalUpdate(before, after),
-                    options: { upsert: false },
-                };
-            }
+            // NEW: always emit a query
+            const query = meta.wasNew
+                ? { op: 'insertOne', doc: after }
+                : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
@@ -247,7 +240,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         before,
                         after,
                         op: meta.wasNew ? 'insert' : 'update',
-                        query,                 // <-- add query here
+                        query, // <-- ensure this is present
                     }],
                     t: Date.now(),
                 }]
@@ -505,6 +498,7 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     });
 }
 
+// 1) helper once in your plugin module
 function buildMinimalUpdate(before: any, after: any) {
     const set: Record<string, any> = {};
     const unset: Record<string, any> = {};
@@ -517,8 +511,14 @@ function buildMinimalUpdate(before: any, after: any) {
             const p = path ? `${path}.${k}` : k;
             const bv = b?.[k];
             const av = a?.[k];
-            const bothObj = bv && av && typeof bv === 'object' && typeof av === 'object' &&
-                !Array.isArray(bv) && !Array.isArray(av);
+
+            const bothObj =
+                bv && av &&
+                typeof bv === 'object' &&
+                typeof av === 'object' &&
+                !Array.isArray(bv) &&
+                !Array.isArray(av);
+
             if (bothObj) {
                 walk(bv, av, p);
             } else if (typeof av === 'undefined') {
