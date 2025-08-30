@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import type { Schema, Model, Query } from 'mongoose';
+import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 
 type Ctx = { sid?: string; aid?: string };
@@ -218,14 +219,17 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
-
-            // Skip embedded subdocuments
             if ((this as any).$isSubdocument) return;
 
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
+
+            // NEW: always emit a query
+            const query = meta.wasNew
+                ? { op: 'insertOne', doc: after }
+                : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
@@ -236,12 +240,12 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         before,
                         after,
                         op: meta.wasNew ? 'insert' : 'update',
+                        query, // <-- ensure this is present
                     }],
                     t: Date.now(),
                 }]
             });
         });
-
 
         // PRE: findOneAndUpdate — capture "before"
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
@@ -284,29 +288,25 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-        // PRE: deleteOne — capture "before"
+        // PRE: deleteOne
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
-            const { sid, aid } = getCtx();
-            if (!sid || !aid) return next();
+            const { sid, aid } = getCtx(); if (!sid || !aid) return next();
             try {
                 const filter = this.getFilter();
-                const model = this.model as Model<any>;
-                (this as any).__repro_before = await model.findOne(filter).lean().exec();
+                (this as any).__repro_before = await (this.model as Model<any>).findOne(filter).lean().exec();
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
+                (this as any).__repro_filter = filter; // <-- keep filter
             } catch {}
             next();
         });
 
+        // POST: deleteOne
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
-            const { sid, aid } = getCtx();
-            if (!sid || !aid) return;
-
+            const { sid, aid } = getCtx(); if (!sid || !aid) return;
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
-
-            const collection =
-                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-
+            const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+            const filter = (this as any).__repro_filter ?? { _id: before._id }; // fallback
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
@@ -316,14 +316,227 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         before,
                         after: null,
                         op: 'delete',
+                        query: { filter },     // <-- add query
                     }],
                     t: Date.now()
                 }]
             });
         });
+
+        if (!(mongoose as any).__repro_query_patched) {
+            (mongoose as any).__repro_query_patched = true;
+
+            const Q = (mongoose as any).Query?.prototype;
+            const Agg = (mongoose as any).Aggregate?.prototype;
+            const origExec = Q?.exec;
+            const origAggExec = Agg?.exec;
+
+            // Patch Query.exec for all model ops (find, findOne, update*, delete*, count*, etc.)
+            if (origExec) {
+                Q.exec = async function patchedExec(this: any, ...args: any[]) {
+                    const { sid, aid } = getCtx();
+                    const t0 = Date.now();
+                    let error: any = null;
+
+                    // gather query facts up front
+                    const collection = this?.model?.collection?.name || 'unknown';
+                    const op = String(this?.op || this?.mquery?.op || 'query');
+                    const filter = safeJson(this.getFilter?.() ?? this._conditions ?? undefined);
+                    const update = safeJson(this.getUpdate?.() ?? this._update ?? undefined);
+                    const projection = safeJson(this.projection?.() ?? this._fields ?? undefined);
+                    const options = safeJson(this.getOptions?.() ?? this.options ?? undefined);
+
+                    try {
+                        const res = await origExec.apply(this, args);
+                        // summarize result (don’t serialize large docs)
+                        const resultMeta = summarizeQueryResult(op, res);
+                        if (sid) emitDbQuery(cfg, sid, aid, {
+                            collection, op,
+                            query: { filter, update, projection, options },
+                            resultMeta,
+                            durMs: Date.now() - t0,
+                            t: Date.now(),
+                        });
+                        return res;
+                    } catch (e: any) {
+                        error = { message: e?.message, code: e?.code };
+                        if (sid) emitDbQuery(cfg, sid, aid, {
+                            collection, op,
+                            query: { filter, update, projection, options },
+                            resultMeta: undefined,
+                            durMs: Date.now() - t0,
+                            t: Date.now(),
+                            error,
+                        });
+                        throw e;
+                    }
+                };
+            }
+
+            // Patch Aggregate.exec
+            if (origAggExec) {
+                Agg.exec = async function patchedAggExec(this: any, ...args: any[]) {
+                    const { sid, aid } = getCtx();
+                    const t0 = Date.now();
+                    const collection = this?.model?.collection?.name || 'unknown';
+                    const op = 'aggregate';
+                    const pipeline = safeJson(this?.pipeline?.() ?? this?._pipeline ?? this?.pipeline ?? undefined);
+                    try {
+                        const res = await origAggExec.apply(this, args);
+                        const resultMeta = summarizeQueryResult(op, res);
+                        if (sid) emitDbQuery(cfg, sid, aid, {
+                            collection, op,
+                            query: { pipeline },
+                            resultMeta,
+                            durMs: Date.now() - t0,
+                            t: Date.now(),
+                        });
+                        return res;
+                    } catch (e: any) {
+                        const error = { message: e?.message, code: e?.code };
+                        if (sid) emitDbQuery(cfg, sid, aid, {
+                            collection, op,
+                            query: { pipeline },
+                            resultMeta: undefined,
+                            durMs: Date.now() - t0,
+                            t: Date.now(),
+                            error,
+                        });
+                        throw e;
+                    }
+                };
+            }
+
+            // Patch Model.bulkWrite
+            const origBulkWrite = (mongoose as any).Model?.bulkWrite;
+            if (origBulkWrite) {
+                (mongoose as any).Model.bulkWrite = async function patchedBulkWrite(this: Model<any>, ops: any[], options?: any) {
+                    const { sid, aid } = getCtx();
+                    const t0 = Date.now();
+                    const collection = (this as any)?.collection?.name || 'unknown';
+                    try {
+                        const res = await origBulkWrite.apply(this, [ops, options]);
+                        const resultMeta = summarizeBulkResult(res);
+                        if (sid) emitDbQuery(cfg, sid, aid, {
+                            collection, op: 'bulkWrite',
+                            query: { bulk: safeJson(ops), options: safeJson(options) },
+                            resultMeta,
+                            durMs: Date.now() - t0,
+                            t: Date.now(),
+                        });
+                        return res;
+                    } catch (e: any) {
+                        const error = { message: e?.message, code: e?.code };
+                        if (sid) emitDbQuery(cfg, sid, aid, {
+                            collection, op: 'bulkWrite',
+                            query: { bulk: safeJson(ops), options: safeJson(options) },
+                            resultMeta: undefined,
+                            durMs: Date.now() - t0,
+                            t: Date.now(),
+                            error,
+                        });
+                        throw e;
+                    }
+                };
+            }
+        }
     };
 }
 
+function summarizeQueryResult(op: string, res: any) {
+    // reads
+    if (op === 'find' || op === 'findOne' || op === 'aggregate' || op.startsWith('count')) {
+        if (Array.isArray(res)) return { docsCount: res.length };
+        if (res && typeof res === 'object' && typeof res.toArray === 'function') return { docsCount: undefined };
+        if (res == null) return { docsCount: 0 };
+        return { docsCount: 1 };
+    }
+    // writes
+    return pickWriteStats(res);
+}
+
+function summarizeBulkResult(res: any) {
+    return {
+        matched: res?.matchedCount ?? res?.nMatched ?? undefined,
+        modified: res?.modifiedCount ?? res?.nModified ?? undefined,
+        upserted: res?.upsertedCount ?? undefined,
+        deleted: res?.deletedCount ?? undefined,
+    };
+}
+
+function pickWriteStats(r: any) {
+    return {
+        matched: r?.matchedCount ?? r?.n ?? r?.nMatched ?? undefined,
+        modified: r?.modifiedCount ?? r?.nModified ?? undefined,
+        upsertedId: r?.upsertedId ?? r?.upserted?._id ?? undefined,
+        deleted: r?.deletedCount ?? undefined,
+    };
+}
+
+function safeJson(v: any) {
+    try { return v == null ? undefined : JSON.parse(JSON.stringify(v)); } catch { return undefined; }
+}
+
+function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
+    if (!sid) return;
+    post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+        entries: [{
+            actionId: aid ?? null,
+            db: [{
+                collection: payload.collection,
+                op: payload.op,
+                // New fields; server will accept them
+                query: payload.query ?? undefined,
+                resultMeta: payload.resultMeta ?? undefined,
+                durMs: payload.durMs ?? undefined,
+                // keep document-diff fields null for pure queries
+                pk: null, before: null, after: null,
+                error: payload.error ?? undefined,
+            }],
+            t: payload.t,
+        }]
+    });
+}
+
+// 1) helper once in your plugin module
+function buildMinimalUpdate(before: any, after: any) {
+    const set: Record<string, any> = {};
+    const unset: Record<string, any> = {};
+
+    function walk(b: any, a: any, path = '') {
+        const bKeys = b ? Object.keys(b) : [];
+        const aKeys = a ? Object.keys(a) : [];
+        const all = new Set([...bKeys, ...aKeys]);
+        for (const k of all) {
+            const p = path ? `${path}.${k}` : k;
+            const bv = b?.[k];
+            const av = a?.[k];
+
+            const bothObj =
+                bv && av &&
+                typeof bv === 'object' &&
+                typeof av === 'object' &&
+                !Array.isArray(bv) &&
+                !Array.isArray(av);
+
+            if (bothObj) {
+                walk(bv, av, p);
+            } else if (typeof av === 'undefined') {
+                unset[p] = '';
+            } else if (JSON.stringify(bv) !== JSON.stringify(av)) {
+                set[p] = av;
+            }
+        }
+    }
+
+    walk(before || {}, after || {});
+    const update: any = {};
+    if (Object.keys(set).length) update.$set = set;
+    if (Object.keys(unset).length) update.$unset = unset;
+    return update;
+}
+
+// Sendgrid
 export type SendgridPatchConfig = {
     appId: string;
     appSecret: string;
@@ -452,3 +665,4 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         return undefined;
     }
 }
+
