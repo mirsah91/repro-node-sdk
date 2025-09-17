@@ -1,72 +1,190 @@
+// index.ts
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import type { Request, Response, NextFunction } from 'express';
 import type { Schema, Model, Query } from 'mongoose';
 import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
+import * as path from 'path';
+import * as fs from 'fs';
 
-type Ctx = { sid?: string; aid?: string };
+// ===================================================================
+// Async context
+// ===================================================================
+type CallEvent = { name: string; t: number; phase: 'enter' | 'exit' };
+type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
-function getCollectionNameFromDoc(doc: any): string | undefined {
-    // Prefer internal collection (Mongoose 8)
-    const direct =
-        doc?.$__?.collection?.collectionName ||
-        (doc?.$collection as any)?.collectionName ||
-        doc?.collection?.collectionName ||
-        (doc?.collection as any)?.name ||
-        (doc?.constructor as any)?.collection?.collectionName;
+// Expose tiny global tracer helpers used by injected code
+declare global {
+    // eslint-disable-next-line no-var
+    var __repro_traceEnter: (name: string) => void;
+    // eslint-disable-next-line no-var
+    var __repro_traceExit: () => void;
+}
 
-    if (direct) return direct;
+if (!(global as any).__repro_traceEnter) {
+    (global as any).__repro_traceEnter = (name: string) => {
+        const ctx = getCtx() as Ctx;
+        if (ctx && ctx.calls) ctx.calls.push({ name, t: Date.now(), phase: 'enter' });
+    };
+}
+if (!(global as any).__repro_traceExit) {
+    (global as any).__repro_traceExit = () => {
+        const ctx = getCtx() as Ctx;
+        if (ctx && ctx.calls) ctx.calls.push({ name: '<exit>', t: Date.now(), phase: 'exit' });
+    };
+}
 
-    // Subdocument? Try ownerDocument()
-    if (doc?.$isSubdocument && typeof doc.ownerDocument === 'function') {
-        const parent = doc.ownerDocument();
-        return (
-            parent?.$__?.collection?.collectionName ||
-            (parent?.$collection as any)?.collectionName ||
-            parent?.collection?.collectionName ||
-            (parent?.collection as any)?.name ||
-            (parent?.constructor as any)?.collection?.collectionName
+// ===================================================================
+/* Function call tracer (require hook via pirates + Babel).
+   Installed once, lazily, on first use of reproMiddleware OR reproMongoosePlugin.
+
+   - Transforms only files under CWD (excludes node_modules + this package).
+   - Injects:
+       __repro_traceEnter("<functionName>");
+       try { ...original... } finally { __repro_traceExit(); }
+   - Names: attempts best-effort extraction; falls back to <anonymous>.
+*/
+let TRACE_INSTALLED = false;
+function installFunctionTracerOnce() {
+    if (TRACE_INSTALLED) return;
+    TRACE_INSTALLED = true;
+
+    let pirates: any, parser: any, traverse: any, generator: any, t: any;
+    try {
+        pirates = require('pirates');
+        parser = require('@babel/parser');
+        traverse = require('@babel/traverse').default;
+        generator = require('@babel/generator').default;
+        t = require('@babel/types');
+    } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+            '[repro] function-call tracer disabled: please `npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save`'
         );
+        return;
     }
 
-    // Discriminator child may have baseModelName
-    const ctor = doc?.constructor as any;
-    if (ctor?.base && ctor?.base?.collection?.collectionName) {
-        return ctor.base.collection.collectionName;
+    const appRoot = process.cwd();
+    const pkgDir = __dirname; // this package location
+    const isFromApp = (filename: string) => {
+        const f = path.resolve(filename);
+        if (f.includes('node_modules')) return false;
+        if (f.startsWith(pkgDir)) return false;
+        return f.startsWith(appRoot);
+    };
+
+    const alreadyTagged = (node: any) =>
+        node?.leadingComments?.some((c: any) => String(c.value || '').includes('@repro_instrumented'));
+
+    function functionDisplayName(p: any): string {
+        const n = p.node;
+
+        // function foo() {}
+        if (t.isFunctionDeclaration(n) && n.id?.name) return n.id.name;
+
+        // const foo = () => {}
+        // const foo = function() {}
+        if (t.isVariableDeclarator(p.parent) && t.isIdentifier(p.parent.id)) {
+            return p.parent.id.name;
+        }
+
+        // class X { method() {} }
+        if ((t.isClassMethod(n) || t.isObjectMethod(n)) && t.isIdentifier(n.key)) return n.key.name;
+
+        // obj = { foo() {} }
+        if (t.isObjectProperty(p.parent) && t.isIdentifier(p.parent.key)) return p.parent.key.name;
+
+        // fallback
+        return '<anonymous>';
     }
 
-    return undefined;
-}
+    function wrapFunctionBody(p: any) {
+        const name = functionDisplayName(p);
 
-function getCollectionNameFromQuery(q: any): string | undefined {
-    return (
-        q?.model?.collection?.collectionName ||
-        (q?.model?.collection as any)?.name
-    );
-}
+        // normalize arrow concise body -> block with return
+        if (t.isArrowFunctionExpression(p.node) && !t.isBlockStatement(p.node.body)) {
+            p.node.body = t.blockStatement([t.returnStatement(p.node.body as any)]);
+        }
 
-function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
-    const name =
-        (type === 'doc'
-            ? getCollectionNameFromDoc(source)
-            : getCollectionNameFromQuery(source)) || undefined;
+        const body: any = p.node.body;
+        if (!t.isBlockStatement(body)) return; // unexpected but keep safe
 
-    if (!name) {
+        if (!alreadyTagged(p.node)) {
+            // Mark
+            (p.node.leadingComments || (p.node.leadingComments = [])).push(
+                t.commentLine(' @repro_instrumented ')
+            );
+
+            // __repro_traceEnter("Name");
+            const enterCall = t.expressionStatement(
+                t.callExpression(t.identifier('__repro_traceEnter'), [t.stringLiteral(name)])
+            );
+
+            // try { /* original body */ } finally { __repro_traceExit(); }
+            const tryStmt = t.tryStatement(
+                t.blockStatement(body.body),
+                null,
+                t.blockStatement([
+                    t.expressionStatement(t.callExpression(t.identifier('__repro_traceExit'), [])),
+                ])
+            );
+
+            // replace body with [enter; try/finally]
+            p.node.body = t.blockStatement([enterCall, tryStmt]);
+        }
+    }
+
+    const transform = (code: string, filename: string): string => {
         try {
-            const modelName =
-                type === 'doc'
-                    ? (source?.constructor as any)?.modelName ||
-                    (source?.ownerDocument?.() as any)?.constructor?.modelName
-                    : source?.model?.modelName;
-            // eslint-disable-next-line no-console
-            console.warn('[repro] could not resolve collection name', { type, modelName });
-        } catch {}
-        return 'unknown';
-    }
-    return name;
+            const ast = parser.parse(code, {
+                sourceType: 'unambiguous',
+                plugins: [
+                    'jsx',
+                    'classProperties',
+                    'classPrivateProperties',
+                    'classPrivateMethods',
+                    'dynamicImport',
+                    'optionalChaining',
+                    'nullishCoalescingOperator',
+                    'topLevelAwait',
+                    // add more as needed
+                ],
+            });
+
+            traverse(ast, {
+                FunctionDeclaration: wrapFunctionBody,
+                FunctionExpression: wrapFunctionBody,
+                ArrowFunctionExpression: wrapFunctionBody,
+                ClassMethod: wrapFunctionBody,
+                ObjectMethod: wrapFunctionBody,
+            });
+
+            const out = generator(ast, { retainLines: true, compact: false, comments: true }, code);
+            return out.code;
+        } catch (e) {
+            // In case of parse/transform error, just return original.
+            return code;
+        }
+    };
+
+    pirates.addHook(
+        (code: string, filename: string) => transform(code, filename),
+        {
+            exts: ['.js', '.cjs', '.mjs'],
+            matcher: (filename: string) => isFromApp(filename),
+            ignoreNodeModules: false, // we manually ignore inside matcher
+        }
+    );
+
+    // eslint-disable-next-line no-console
+    console.log('[repro] function-call tracer installed');
 }
 
+// ===================================================================
+// HTTP post helper
+// ===================================================================
 async function post(apiBase: string, appId: string, appSecret: string, sessionId: string, body: any) {
     try {
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
@@ -109,9 +227,12 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
 }
 
 // ===================================================================
-// reproMiddleware — now captures respBody (+ key) and posts both url & path
+// reproMiddleware — captures respBody, key, and now the per-request function-call sequence
 // ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
+    // Ensure the tracer is installed once in the process
+    installFunctionTracerOnce();
+
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
@@ -120,7 +241,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         const t0 = Date.now();
         const rid = String(t0);
         const url = (req as any).originalUrl || req.url || '/'; // send as 'url'
-        const path = url;                                       // keep 'path' for back-compat
+        const pathUrl = url;                                     // keep 'path' for back-compat
         const key = normalizeRouteKey(req.method, url);
 
         // ---- Capture response body robustly (json/send/write/end) ----
@@ -153,7 +274,20 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             return origEnd(chunk, ...args);
         };
 
-        als.run({ sid, aid }, () => {
+        // Run the request under ALS, with a per-request call buffer
+        als.run({ sid, aid, calls: [] }, () => {
+            // Decorate some well-known functions to appear in the sequence with friendly names
+            // (These wrappers just add a named enter/exit around the original)
+            const mark = (name: string, fn: Function) => {
+                return function wrapped(this: any, ...args: any[]) {
+                    (global as any).__repro_traceEnter(name);
+                    try { return fn.apply(this, args); }
+                    finally { (global as any).__repro_traceExit(); }
+                };
+            };
+            // res.json marker (many apps return via json)
+            (res as any).json = mark('res.json', (res as any).json);
+
             res.on('finish', () => {
                 // If nothing captured via json/send, try assembled chunks
                 if (capturedBody === undefined && chunks.length) {
@@ -163,37 +297,111 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
+                // Pull the call sequence from ALS
+                const ctx = getCtx() as Ctx;
+                const sequence = (ctx.calls || [])
+                    .filter(c => c.phase === 'enter')
+                    .map(c => c.name);
+
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
                         request: {
                             rid,
                             method: req.method,
-                            url,                       // NEW: explicit url (API stores this)
-                            path,                      // kept for backward compat
+                            url,
+                            path: pathUrl,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
                             headers: {},               // (optional) sanitize & include if desired
-                            key,                       // NEW: e.g. "GET /items"
-                            respBody: capturedBody,    // NEW: JSON if parseable, else string
+                            key,
+                            respBody: capturedBody,
+                            trace: { sequence },       // <-- NEW: ordered function call names
                         },
                         t: Date.now(),
                     }]
                 });
             });
+
             next();
         });
     };
 }
 
 // ===================================================================
-// reproMongoosePlugin — unchanged logic, light polish
+// Mongo collection resolvers & helpers (from your original code)
+// ===================================================================
+function getCollectionNameFromDoc(doc: any): string | undefined {
+    // Prefer internal collection (Mongoose 8)
+    const direct =
+        doc?.$__?.collection?.collectionName ||
+        (doc?.$collection as any)?.collectionName ||
+        doc?.collection?.collectionName ||
+        (doc?.collection as any)?.name ||
+        (doc?.constructor as any)?.collection?.collectionName;
+
+    if (direct) return direct;
+
+    // Subdocument? Try ownerDocument()
+    if (doc?.$isSubdocument && typeof (doc as any).ownerDocument === 'function') {
+        const parent = (doc as any).ownerDocument();
+        return (
+            parent?.$__?.collection?.collectionName ||
+            (parent?.$collection as any)?.collectionName ||
+            parent?.collection?.collectionName ||
+            (parent?.collection as any)?.name ||
+            (parent?.constructor as any)?.collection?.collectionName
+        );
+    }
+
+    // Discriminator child may have baseModelName
+    const ctor = doc?.constructor as any;
+    if (ctor?.base && ctor?.base?.collection?.collectionName) {
+        return ctor.base.collection.collectionName;
+    }
+
+    return undefined;
+}
+
+function getCollectionNameFromQuery(q: any): string | undefined {
+    return (
+        q?.model?.collection?.collectionName ||
+        (q?.model?.collection as any)?.name
+    );
+}
+
+function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
+    const name =
+        (type === 'doc'
+            ? getCollectionNameFromDoc(source)
+            : getCollectionNameFromQuery(source)) || undefined;
+
+    if (!name) {
+        try {
+            const modelName =
+                type === 'doc'
+                    ? (source?.constructor as any)?.modelName ||
+                    (source?.ownerDocument?.() as any)?.constructor?.modelName
+                    : source?.model?.modelName;
+            // eslint-disable-next-line no-console
+            console.warn('[repro] could not resolve collection name', { type, modelName });
+        } catch { /* noop */ }
+        return 'unknown';
+    }
+    return name;
+}
+
+// ===================================================================
+// Mongoose plugin — unchanged logic, plus: ensure tracer is installed once
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
+    // Ensure the tracer is installed even if user only calls mongoose.plugin(...)
+    installFunctionTracerOnce();
+
     return function (schema: Schema) {
         // PRE: save
         schema.pre('save', { document: true }, async function (next) {
-            const { sid, aid } = getCtx();
+            const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
 
             // Skip embedded subdocuments — they don't have their own collection
@@ -203,9 +411,9 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             try {
                 if (!this.isNew) {
                     const model = this.constructor as Model<any>;
-                    before = await model.findById(this._id).lean().exec();
+                    before = await model.findById((this as any)._id).lean().exec();
                 }
-            } catch {}
+            } catch { /* noop */ }
 
             (this as any).__repro_meta = {
                 wasNew: this.isNew,
@@ -217,30 +425,30 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 
         // POST: save
         schema.post('save', { document: true }, function () {
-            const { sid, aid } = getCtx();
+            const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return;
             if ((this as any).$isSubdocument) return;
 
             const meta = (this as any).__repro_meta || {};
             const before = meta.before ?? null;
-            const after = this.toObject({ depopulate: true });
+            const after = (this as any).toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
 
             // NEW: always emit a query
             const query = meta.wasNew
                 ? { op: 'insertOne', doc: after }
-                : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
+                : { filter: { _id: (this as any)._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
-                    actionId: aid!,
+                    actionId: (getCtx() as Ctx).aid!,
                     db: [{
                         collection,
-                        pk: { _id: this._id },
+                        pk: { _id: (this as any)._id },
                         before,
                         after,
                         op: meta.wasNew ? 'insert' : 'update',
-                        query, // <-- ensure this is present
+                        query,
                     }],
                     t: Date.now(),
                 }]
@@ -249,21 +457,21 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 
         // PRE: findOneAndUpdate — capture "before"
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
-            const { sid, aid } = getCtx();
+            const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
             try {
-                const filter = this.getFilter();
-                const model = this.model as Model<any>;
+                const filter = (this as any).getFilter();
+                const model = (this as any).model as Model<any>;
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
-                this.setOptions({ new: true });
+                (this as any).setOptions({ new: true });
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
-            } catch {}
+            } catch { /* noop */ }
             next();
         });
 
         // POST: findOneAndUpdate — emit change
         schema.post<Query<any, any>>('findOneAndUpdate', function (res: any) {
-            const { sid, aid } = getCtx();
+            const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return;
 
             const before = (this as any).__repro_before ?? null;
@@ -273,9 +481,9 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
-                    actionId: aid!,
+                    actionId: (getCtx() as Ctx).aid!,
                     db: [{
                         collection,
                         pk: { _id: pk },
@@ -290,26 +498,26 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 
         // PRE: deleteOne
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
-            const { sid, aid } = getCtx(); if (!sid || !aid) return next();
+            const { sid, aid } = getCtx() as Ctx; if (!sid || !aid) return next();
             try {
-                const filter = this.getFilter();
-                (this as any).__repro_before = await (this.model as Model<any>).findOne(filter).lean().exec();
+                const filter = (this as any).getFilter();
+                (this as any).__repro_before = await ((this as any).model as Model<any>).findOne(filter).lean().exec();
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
                 (this as any).__repro_filter = filter; // <-- keep filter
-            } catch {}
+            } catch { /* noop */ }
             next();
         });
 
         // POST: deleteOne
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
-            const { sid, aid } = getCtx(); if (!sid || !aid) return;
+            const { sid, aid } = getCtx() as Ctx; if (!sid || !aid) return;
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const filter = (this as any).__repro_filter ?? { _id: before._id }; // fallback
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
-                    actionId: aid!,
+                    actionId: (getCtx() as Ctx).aid!,
                     db: [{
                         collection,
                         pk: { _id: before._id },
@@ -334,7 +542,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             // Patch Query.exec for all model ops (find, findOne, update*, delete*, count*, etc.)
             if (origExec) {
                 Q.exec = async function patchedExec(this: any, ...args: any[]) {
-                    const { sid, aid } = getCtx();
+                    const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
                     let error: any = null;
 
@@ -376,7 +584,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             // Patch Aggregate.exec
             if (origAggExec) {
                 Agg.exec = async function patchedAggExec(this: any, ...args: any[]) {
-                    const { sid, aid } = getCtx();
+                    const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
                     const collection = this?.model?.collection?.name || 'unknown';
                     const op = 'aggregate';
@@ -411,7 +619,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const origBulkWrite = (mongoose as any).Model?.bulkWrite;
             if (origBulkWrite) {
                 (mongoose as any).Model.bulkWrite = async function patchedBulkWrite(this: Model<any>, ops: any[], options?: any) {
-                    const { sid, aid } = getCtx();
+                    const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
                     const collection = (this as any)?.collection?.name || 'unknown';
                     try {
@@ -447,7 +655,7 @@ function summarizeQueryResult(op: string, res: any) {
     // reads
     if (op === 'find' || op === 'findOne' || op === 'aggregate' || op.startsWith('count')) {
         if (Array.isArray(res)) return { docsCount: res.length };
-        if (res && typeof res === 'object' && typeof res.toArray === 'function') return { docsCount: undefined };
+        if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') return { docsCount: undefined };
         if (res == null) return { docsCount: 0 };
         return { docsCount: 1 };
     }
@@ -503,12 +711,12 @@ function buildMinimalUpdate(before: any, after: any) {
     const set: Record<string, any> = {};
     const unset: Record<string, any> = {};
 
-    function walk(b: any, a: any, path = '') {
+    function walk(b: any, a: any, pathKey = '') {
         const bKeys = b ? Object.keys(b) : [];
         const aKeys = a ? Object.keys(a) : [];
         const all = new Set([...bKeys, ...aKeys]);
         for (const k of all) {
-            const p = path ? `${path}.${k}` : k;
+            const p = pathKey ? `${pathKey}.${k}` : k;
             const bv = b?.[k];
             const av = a?.[k];
 
@@ -536,7 +744,9 @@ function buildMinimalUpdate(before: any, after: any) {
     return update;
 }
 
-// Sendgrid
+// ===================================================================
+// SendGrid patch (unchanged, just here for completeness)
+// ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
     appSecret: string;
@@ -589,7 +799,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
     }
 
     function fireCapture(kind: 'send' | 'sendMultiple', rawMsg: any, t0: number, statusCode?: number, headers?: any) {
-        const ctx = getCtx();
+        const ctx = getCtx() as Ctx;
         const sid = ctx.sid ?? cfg.resolveContext?.()?.sid;
         const aid = ctx.aid ?? cfg.resolveContext?.()?.aid;
         if (!sid) return;
@@ -626,7 +836,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         return out.length ? out : undefined;
     }
     function normalizeSendgridMessage(msg: any) {
-        const base = {
+        const base: any = {
             from: normalizeAddress(msg?.from) ?? undefined,
             to: normalizeAddressList(msg?.to),
             cc: normalizeAddressList(msg?.cc),
@@ -652,8 +862,8 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
             base.cc = normalizeAddressList(p0.cc) ?? base.cc;
             base.bcc = normalizeAddressList(p0.bcc) ?? base.bcc;
             if (!base.subject && p0.subject) base.subject = String(p0.subject);
-            if (!base.dynamicTemplateData && p0.dynamic_template_data) base.dynamicTemplateData = p0.dynamic_template_data;
-            if (!base.customArgs && p0.custom_args) base.customArgs = p0.custom_args;
+            if (!base.dynamicTemplateData && (p0 as any).dynamic_template_data) base.dynamicTemplateData = (p0 as any).dynamic_template_data;
+            if (!base.customArgs && (p0 as any).custom_args) base.customArgs = (p0 as any).custom_args;
         }
         return base;
     }
@@ -661,8 +871,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         try {
             if (typeof content === 'string') return Buffer.byteLength(content, 'utf8');
             if (content && typeof content === 'object' && 'length' in content) return Number((content as any).length);
-        } catch {}
+        } catch { /* noop */ }
         return undefined;
     }
 }
-
