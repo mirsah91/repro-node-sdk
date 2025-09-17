@@ -6,39 +6,39 @@ import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
 
-// ===================================================================
-// Async context for per-request call logs
-// ===================================================================
 type CallEvent = { name: string; t: number; phase: 'enter' | 'exit' };
 type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
-// Expose tiny global tracer helpers used by injected code
+function logLine(s: string) {
+    try { process.stdout.write(s + '\n'); } catch {}
+}
+
+// ---- global tracer helpers (use stdout, NOT console, to avoid recursion)
 declare global {
     // eslint-disable-next-line no-var
     var __repro_traceEnter: (name: string) => void;
     // eslint-disable-next-line no-var
     var __repro_traceExit: () => void;
 }
-
 if (!(global as any).__repro_traceEnter) {
     (global as any).__repro_traceEnter = (name: string) => {
         const ctx = getCtx() as Ctx;
         if (ctx && ctx.calls) ctx.calls.push({ name, t: Date.now(), phase: 'enter' });
-        console.log('[repro][enter]', name);
+        logLine(`[repro][enter] ${name}`);
     };
 }
 if (!(global as any).__repro_traceExit) {
     (global as any).__repro_traceExit = () => {
         const ctx = getCtx() as Ctx;
         if (ctx && ctx.calls) ctx.calls.push({ name: '<exit>', t: Date.now(), phase: 'exit' });
-        console.log('[repro][exit]');
+        logLine(`[repro][exit]`);
     };
 }
 
 // ===================================================================
-// EXPRESS GLOBAL PATCH — wraps all Router handlers so they appear in trace
+// EXPRESS GLOBAL PATCH — wrap all handlers so they show in trace
 // ===================================================================
 let EXPRESS_PATCHED = false;
 function patchExpressOnce() {
@@ -46,7 +46,7 @@ function patchExpressOnce() {
     EXPRESS_PATCHED = true;
 
     let express: any;
-    try { express = require('express'); } catch { return; } // express not present yet
+    try { express = require('express'); } catch { return; }
 
     const RP = express?.Router?.prototype;
     if (!RP || (RP as any).__repro_patched) return;
@@ -61,7 +61,6 @@ function patchExpressOnce() {
             try { return fn.apply(this, args); }
             finally { (global as any).__repro_traceExit(); }
         };
-        // keep function name for nicer stacks
         try { Object.defineProperty(wrapped, 'name', { value: name, configurable: true }); } catch {}
         return wrapped;
     };
@@ -72,22 +71,18 @@ function patchExpressOnce() {
         return out;
     };
 
-    // For each HTTP method, wrap every handler argument with a friendly name
     for (const m of methods) {
         const orig = RP[m];
         if (!orig) continue;
         RP[m] = function patchedMethod(this: any, ...args: any[]) {
-            // Determine a path (if first arg is a string/regex/function)
             let base = '';
             if (typeof args[0] === 'string') base = args[0];
             else if (args[0] && args[0].fast_slash) base = '/';
-            // Build names like "POST /items handler" or "MWARE /items"
+
             const flat = flatten(args);
             const rebuilt = flat.map((h: any) => {
                 if (typeof h === 'function') {
-                    const label = (m.toUpperCase() === 'USE')
-                        ? `MWARE ${base || '(router)'}`
-                        : `${m.toUpperCase()} ${base || '(dynamic)'}`;
+                    const label = (m.toUpperCase() === 'USE') ? `MWARE ${base || '(router)'}` : `${m.toUpperCase()} ${base || '(dynamic)'}`;
                     return wrapFn(`${label} handler`, h);
                 }
                 return h;
@@ -96,32 +91,43 @@ function patchExpressOnce() {
         };
     }
 
-    console.log('[repro] express router patched for call tracing');
+    logLine('[repro] express router patched for call tracing');
 }
 patchExpressOnce();
 
 // ===================================================================
-// CONSOLE SHIM — attribute console.* calls to the calling function
-// Captures helpers like `test()` that log.
+// CONSOLE SHIM — attribute console.* to caller function (skip tracer)
 // ===================================================================
 let CONSOLE_PATCHED = false;
 function patchConsoleOnce() {
     if (CONSOLE_PATCHED) return;
     CONSOLE_PATCHED = true;
 
-    const mk = (orig: Function, level: string) => {
+    const c: any = console as any;
+    if (c.__repro_patched) return;
+    c.__repro_patched = true;
+
+    const TRACER_FILE = __filename.replace(/\\/g, '/');
+
+    const mk = (orig: Function) => {
         return function patchedConsole(this: any, ...args: any[]) {
-            // Try to infer the *caller* function name from stack
+            // derive caller name; skip if coming from tracer code
             let caller = '';
+            let skip = false;
             try {
                 const stack = new Error().stack?.split('\n') || [];
-                // stack[0] = Error, stack[1] = this function, stack[2] = caller
-                const frame = stack[2] || '';
-                // formats: "    at test (/path/file.js:line:col)" or "    at /path/file.js:line:col"
-                const m = frame.match(/at\s+(.*)\s+\(/) || frame.match(/at\s+([^\s]+)\s*$/);
-                caller = (m && m[1] && !m[1].includes('/')) ? m[1] : '';
+                // find first frame that is NOT our own file and not our tracer helpers
+                for (let i = 2; i < Math.min(stack.length, 10); i++) {
+                    const frame = stack[i] || '';
+                    if (frame.includes(TRACER_FILE)) { continue; }
+                    if (frame.includes('__repro_traceEnter') || frame.includes('__repro_traceExit')) { skip = true; break; }
+                    const m = frame.match(/at\s+([^\s(]+)\s*\(/) || frame.match(/at\s+([^\s(]+)\s*$/);
+                    const n = m?.[1];
+                    if (n && !n.includes('/')) { caller = n; break; }
+                }
             } catch {}
-            if (caller) {
+
+            if (!skip && caller) {
                 try { (global as any).__repro_traceEnter(caller); } catch {}
                 try { /* no-op */ } finally { try { (global as any).__repro_traceExit(); } catch {} }
             }
@@ -129,25 +135,19 @@ function patchConsoleOnce() {
         };
     };
 
-    const c: any = console as any;
-    if (!c.__repro_patched) {
-        c.__repro_patched = true;
-        c.log    = mk(c.log,    'log');
-        c.info   = mk(c.info,   'info');
-        c.warn   = mk(c.warn,   'warn');
-        c.error  = mk(c.error,  'error');
-        c.debug  = mk(c.debug ?? c.log, 'debug');
-        console.log('[repro] console patched for call tracing');
-    }
+    c.log   = mk(c.log);
+    c.info  = mk(c.info);
+    c.warn  = mk(c.warn);
+    c.error = mk(c.error);
+    c.debug = mk(c.debug ?? c.log);
+    // NOTE: we do NOT log here via console to avoid self-capture
+    logLine('[repro] console patched for call tracing');
 }
 patchConsoleOnce();
 
 // ===================================================================
-/* Function call tracer (require hook via pirates + Babel).
-   Still installed for full source-level tracing of other modules,
-   but *you will see function names even without it* thanks to the
-   Express + console fallbacks above.
-*/
+// Optional pirates/Babel source tracing (best effort; safe to miss)
+// ===================================================================
 let TRACE_INSTALLED = false;
 function installFunctionTracerOnce() {
     if (TRACE_INSTALLED) return;
@@ -165,9 +165,7 @@ function installFunctionTracerOnce() {
         generator = require('@babel/generator').default;
         t = require('@babel/types');
     } catch {
-        console.warn(
-            '[repro] function-call tracer unavailable: please `npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save`'
-        );
+        logLine('[repro] function-call tracer unavailable: npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save');
         return;
     }
 
@@ -222,44 +220,36 @@ function installFunctionTracerOnce() {
             const ast = parser.parse(code, {
                 sourceType: 'unambiguous',
                 plugins: [
-                    'jsx',
-                    'typescript',
-                    'classProperties',
-                    'classPrivateProperties',
-                    'classPrivateMethods',
-                    'dynamicImport',
-                    'optionalChaining',
-                    'nullishCoalescingOperator',
-                    'topLevelAwait',
+                    'jsx','typescript','classProperties','classPrivateProperties','classPrivateMethods',
+                    'dynamicImport','optionalChaining','nullishCoalescingOperator','topLevelAwait',
                 ],
             });
-            require('@babel/traverse').default(ast, {
+            traverse(ast, {
                 FunctionDeclaration: wrapFunctionBody,
                 FunctionExpression: wrapFunctionBody,
                 ArrowFunctionExpression: wrapFunctionBody,
                 ClassMethod: wrapFunctionBody,
                 ObjectMethod: wrapFunctionBody,
             });
-            const out = require('@babel/generator').default(ast, { retainLines: true, compact: false, comments: true }, code);
+            const out = generator(ast, { retainLines: true, compact: false, comments: true }, code);
             return out.code;
         } catch {
             return code;
         }
     };
 
-    require('pirates').addHook(
+    pirates.addHook(
         (code: string) => transform(code),
-        { exts: ['.js', '.cjs', '.mjs', '.ts', '.tsx'], matcher: (filename: string) => isFromApp(filename), ignoreNodeModules: false }
+        { exts: ['.js','.cjs','.mjs','.ts','.tsx'], matcher: (filename: string) => isFromApp(filename), ignoreNodeModules: false }
     );
 
-    console.log('[repro] function-call tracer installed');
+    logLine('[repro] function-call tracer installed');
 
     const preloaded = loadedAppFiles.filter(f => !f.startsWith(pkgDir)).slice(0, 5);
     if (preloaded.length) {
-        console.warn('[repro] tracer installed after some app files were loaded. Move your SDK import earlier so functions inside these files are traced:', preloaded);
+        logLine('[repro] tracer installed after some app files were loaded. Move your SDK import earlier so functions inside these files are traced: ' + JSON.stringify(preloaded));
     }
 }
-// Install tracer at module import time (keep it best-effort)
 installFunctionTracerOnce();
 
 // ===================================================================
@@ -272,25 +262,21 @@ async function post(apiBase: string, appId: string, appSecret: string, sessionId
             headers: { 'Content-Type': 'application/json', 'X-App-Id': appId, 'X-App-Secret': appSecret },
             body: JSON.stringify(body),
         });
-    } catch { /* swallow in SDK */ }
+    } catch {}
 }
 
-// -------- helpers for response capture & grouping --------
+// -------- helpers
 function normalizeRouteKey(method: string, rawPath: string) {
     const base = (rawPath || '/').split('?')[0] || '/';
     return `${String(method || 'GET').toUpperCase()} ${base}`;
 }
-
 function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
     if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
     const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
-    const isLikelyJson = ct.toLowerCase().includes('application/json');
+    const isJson = ct.toLowerCase().includes('application/json');
     try {
-        if (Buffer.isBuffer(body)) {
-            const s = body.toString('utf8');
-            return isLikelyJson ? JSON.parse(s) : s;
-        }
-        if (typeof body === 'string') return isLikelyJson ? JSON.parse(body) : body;
+        if (Buffer.isBuffer(body)) { const s = body.toString('utf8'); return isJson ? JSON.parse(s) : s; }
+        if (typeof body === 'string') return isJson ? JSON.parse(body) : body;
     } catch {
         if (Buffer.isBuffer(body)) return body.toString('utf8');
         if (typeof body === 'string') return body;
@@ -299,40 +285,34 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
 }
 
 // ===================================================================
-// reproMiddleware — captures respBody, key, and per-request function-call sequence
+// reproMiddleware — captures respBody + per-request call sequence
 // ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
-        if (!sid || !aid) return next(); // only capture tagged requests
+        if (!sid || !aid) return next();
 
         const t0 = Date.now();
         const rid = String(t0);
         const url = (req as any).originalUrl || req.url || '/';
-        const pathUrl = url;
         const key = normalizeRouteKey(req.method, url);
 
-        // ---- Capture response body robustly (json/send/write/end) ----
         let capturedBody: any = undefined;
         const origJson = res.json.bind(res as any);
         (res as any).json = (body: any) => { capturedBody = body; return origJson(body); };
-
         const origSend = res.send.bind(res as any);
         (res as any).send = (body: any) => {
             if (capturedBody === undefined) capturedBody = coerceBodyToStorable(body, res.getHeader?.('content-type'));
             return origSend(body);
         };
-
         const origWrite = (res as any).write.bind(res as any);
         const origEnd = (res as any).end.bind(res as any);
         const chunks: Array<Buffer | string> = [];
         (res as any).write = (chunk: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origWrite(chunk, ...args); };
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
-        // Run the request under ALS, with a per-request call buffer
         als.run({ sid, aid, calls: [] }, () => {
-            // Tag res.json so it appears as a friendly step in the sequence
             const mark = (name: string, fn: Function) =>
                 function wrapped(this: any, ...args: any[]) { (global as any).__repro_traceEnter(name); try { return fn.apply(this, args); } finally { (global as any).__repro_traceExit(); } };
             (res as any).json = mark('res.json', (res as any).json);
@@ -348,13 +328,13 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                 const ctx = getCtx() as Ctx;
                 const sequence = (ctx.calls || []).filter(c => c.phase === 'enter').map(c => c.name);
 
-                console.log('[repro] trace sequence', { key, status: res.statusCode, sequence });
+                logLine(`[repro] trace sequence ${JSON.stringify({ key, status: res.statusCode, sequence })}`);
 
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
                         request: {
-                            rid, method: req.method, url, path: pathUrl,
+                            rid, method: req.method, url, path: url,
                             status: res.statusCode, durMs: Date.now() - t0, headers: {},
                             key, respBody: capturedBody, trace: { sequence },
                         },
@@ -369,7 +349,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 }
 
 // ===================================================================
-// Mongo helpers (unchanged)
+// Mongo helpers & plugin (unchanged except create wrapper for visibility)
 // ===================================================================
 function getCollectionNameFromDoc(doc: any): string | undefined {
     const direct =
@@ -396,11 +376,9 @@ function getCollectionNameFromDoc(doc: any): string | undefined {
     }
     return undefined;
 }
-
 function getCollectionNameFromQuery(q: any): string | undefined {
     return q?.model?.collection?.collectionName || (q?.model?.collection as any)?.name;
 }
-
 function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
     const name = (type === 'doc' ? getCollectionNameFromDoc(source) : getCollectionNameFromQuery(source)) || undefined;
     if (!name) {
@@ -409,18 +387,14 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
                 type === 'doc'
                     ? (source?.constructor as any)?.modelName || (source?.ownerDocument?.() as any)?.constructor?.modelName
                     : source?.model?.modelName;
-            console.warn('[repro] could not resolve collection name', { type, modelName });
+            logLine('[repro] could not resolve collection name ' + JSON.stringify({ type, modelName }));
         } catch {}
         return 'unknown';
     }
     return name;
 }
 
-// ===================================================================
-// Mongoose plugin — original behavior + some call logging
-// ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
-    // Make Model.create visible even without source transform
     if (!(mongoose as any).__repro_model_calllog_patched) {
         (mongoose as any).__repro_model_calllog_patched = true;
         const origCreate = (mongoose as any).Model?.create;
@@ -434,7 +408,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
     }
 
     return function (schema: Schema) {
-        // PRE: save
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
@@ -451,7 +424,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
-        // POST: save
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return;
@@ -475,7 +447,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-        // PRE: findOneAndUpdate
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
@@ -489,7 +460,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
-        // POST: findOneAndUpdate
         schema.post<Query<any, any>>('findOneAndUpdate', function (res: any) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return;
@@ -497,7 +467,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-
             const pk = after?._id ?? before?._id;
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
@@ -509,7 +478,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-        // PRE: deleteOne
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
             const { sid, aid } = getCtx() as Ctx; if (!sid || !aid) return next();
             try {
@@ -521,7 +489,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
-        // POST: deleteOne
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
             const { sid, aid } = getCtx() as Ctx; if (!sid || !aid) return;
             const before = (this as any).__repro_before ?? null;
@@ -549,7 +516,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 Q.exec = async function patchedExec(this: any, ...args: any[]) {
                     const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
-
                     const collection = this?.model?.collection?.name || 'unknown';
                     const op = String(this?.op || this?.mquery?.op || 'query');
                     const filter = safeJson(this.getFilter?.() ?? this._conditions ?? undefined);
@@ -618,7 +584,6 @@ function summarizeQueryResult(op: string, res: any) {
     }
     return pickWriteStats(res);
 }
-
 function summarizeBulkResult(res: any) {
     return {
         matched: res?.matchedCount ?? res?.nMatched ?? undefined,
@@ -627,7 +592,6 @@ function summarizeBulkResult(res: any) {
         deleted: res?.deletedCount ?? undefined,
     };
 }
-
 function pickWriteStats(r: any) {
     return {
         matched: r?.matchedCount ?? r?.n ?? r?.nMatched ?? undefined,
@@ -636,11 +600,9 @@ function pickWriteStats(r: any) {
         deleted: r?.deletedCount ?? undefined,
     };
 }
-
 function safeJson(v: any) {
     try { return v == null ? undefined : JSON.parse(JSON.stringify(v)); } catch { return undefined; }
 }
-
 function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     if (!sid) return;
     post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
@@ -659,7 +621,6 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
         }]
     });
 }
-
 function buildMinimalUpdate(before: any, after: any) {
     const set: Record<string, any> = {};
     const unset: Record<string, any> = {};
@@ -672,13 +633,9 @@ function buildMinimalUpdate(before: any, after: any) {
             const bv = b?.[k];
             const av = a?.[k];
             const bothObj = bv && av && typeof bv === 'object' && typeof av === 'object' && !Array.isArray(bv) && !Array.isArray(av);
-            if (bothObj) {
-                walk(bv, av, p);
-            } else if (typeof av === 'undefined') {
-                unset[p] = '';
-            } else if (JSON.stringify(bv) !== JSON.stringify(av)) {
-                set[p] = av;
-            }
+            if (bothObj) { walk(bv, av, p); }
+            else if (typeof av === 'undefined') { unset[p] = ''; }
+            else if (JSON.stringify(bv) !== JSON.stringify(av)) { set[p] = av; }
         }
     }
     walk(before || {}, after || {});
@@ -697,7 +654,6 @@ export type SendgridPatchConfig = {
     apiBase: string,
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
 };
-
 export function patchSendgridMail(cfg: SendgridPatchConfig) {
     let sgMail: any;
     try { sgMail = require('@sendgrid/mail'); } catch { return; }
