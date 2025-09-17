@@ -26,8 +26,6 @@ if (!(global as any).__repro_traceEnter) {
     (global as any).__repro_traceEnter = (name: string) => {
         const ctx = getCtx() as Ctx;
         if (ctx && ctx.calls) ctx.calls.push({ name, t: Date.now(), phase: 'enter' });
-        // Unconditional log:
-        // Using a short prefix so it’s easy to grep without flooding with JSON
         console.log('[repro][enter]', name);
     };
 }
@@ -40,19 +38,17 @@ if (!(global as any).__repro_traceExit) {
 }
 
 // ===================================================================
-/* Function call tracer (require hook via pirates + Babel).
-   Installed once, lazily, on first use of reproMiddleware OR reproMongoosePlugin.
-
-   - Transforms only files under CWD (excludes node_modules + this package).
-   - Injects:
-       __repro_traceEnter("<functionName>");
-       try { ...original... } finally { __repro_traceExit(); }
-   - Names: best-effort extraction; falls back to <anonymous>.
-*/
+// Function call tracer (pirates + Babel) — install ASAP
+// ===================================================================
 let TRACE_INSTALLED = false;
 function installFunctionTracerOnce() {
     if (TRACE_INSTALLED) return;
     TRACE_INSTALLED = true;
+
+    // Detect already-loaded app files so we can warn about import order
+    const appRoot = process.cwd();
+    const loadedAppFiles = Object.keys(require.cache || {})
+        .filter(f => f.startsWith(appRoot) && !f.includes('node_modules'));
 
     let pirates: any, parser: any, traverse: any, generator: any, t: any;
     try {
@@ -61,15 +57,14 @@ function installFunctionTracerOnce() {
         traverse = require('@babel/traverse').default;
         generator = require('@babel/generator').default;
         t = require('@babel/types');
-    } catch (e) {
+    } catch {
         console.warn(
             '[repro] function-call tracer unavailable: please `npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save`'
         );
         return;
     }
 
-    const appRoot = process.cwd();
-    const pkgDir = __dirname; // this package location
+    const pkgDir = __dirname;
     const isFromApp = (filename: string) => {
         const f = path.resolve(filename);
         if (f.includes('node_modules')) return false;
@@ -82,32 +77,18 @@ function installFunctionTracerOnce() {
 
     function functionDisplayName(p: any): string {
         const n = p.node;
-
-        // function foo() {}
         if (t.isFunctionDeclaration(n) && n.id?.name) return n.id.name;
-
-        // const foo = () => {} / const foo = function() {}
-        if (t.isVariableDeclarator(p.parent) && t.isIdentifier(p.parent.id)) {
-            return p.parent.id.name;
-        }
-
-        // class X { method() {} }
+        if (t.isVariableDeclarator(p.parent) && t.isIdentifier(p.parent.id)) return p.parent.id.name;
         if ((t.isClassMethod(n) || t.isObjectMethod(n)) && t.isIdentifier(n.key)) return n.key.name;
-
-        // obj = { foo() {} }
         if (t.isObjectProperty(p.parent) && t.isIdentifier(p.parent.key)) return p.parent.key.name;
-
         return '<anonymous>';
     }
 
     function wrapFunctionBody(p: any) {
         const name = functionDisplayName(p);
-
-        // normalize arrow concise body -> block with return
         if (t.isArrowFunctionExpression(p.node) && !t.isBlockStatement(p.node.body)) {
             p.node.body = t.blockStatement([t.returnStatement(p.node.body as any)]);
         }
-
         const body: any = p.node.body;
         if (!t.isBlockStatement(body)) return;
 
@@ -116,12 +97,9 @@ function installFunctionTracerOnce() {
                 t.commentLine(' @repro_instrumented ')
             );
 
-            // __repro_traceEnter("Name");
             const enterCall = t.expressionStatement(
                 t.callExpression(t.identifier('__repro_traceEnter'), [t.stringLiteral(name)])
             );
-
-            // try { /* original body */ } finally { __repro_traceExit(); }
             const tryStmt = t.tryStatement(
                 t.blockStatement(body.body),
                 null,
@@ -129,8 +107,6 @@ function installFunctionTracerOnce() {
                     t.expressionStatement(t.callExpression(t.identifier('__repro_traceExit'), [])),
                 ])
             );
-
-            // replace body with [enter; try/finally]
             p.node.body = t.blockStatement([enterCall, tryStmt]);
         }
     }
@@ -163,7 +139,6 @@ function installFunctionTracerOnce() {
             const out = generator(ast, { retainLines: true, compact: false, comments: true }, code);
             return out.code;
         } catch {
-            // On parse/transform error, keep original code.
             return code;
         }
     };
@@ -178,7 +153,18 @@ function installFunctionTracerOnce() {
     );
 
     console.log('[repro] function-call tracer installed');
+
+    // If some app files were already loaded, warn (these won’t be instrumented)
+    const preloaded = loadedAppFiles
+        .filter(f => !f.startsWith(pkgDir))
+        .slice(0, 5);
+    if (preloaded.length) {
+        console.warn('[repro] tracer installed after some app files were loaded. Move your SDK import earlier so functions inside these files are traced:', preloaded);
+    }
 }
+
+// Install tracer at module import time (critical for catching user routes)
+installFunctionTracerOnce();
 
 // ===================================================================
 // HTTP post helper
@@ -224,7 +210,7 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
 // reproMiddleware — captures respBody, key, and per-request function-call sequence
 // ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
-    // Ensure the tracer is installed once in the process
+    // tracer already installed at top-level; keep here to be safe in odd loaders
     installFunctionTracerOnce();
 
     return function (req: Request, res: Response, next: NextFunction) {
@@ -254,7 +240,6 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             return origSend(body);
         };
 
-        // If the handler uses res.write/res.end directly, accumulate chunks
         const origWrite = (res as any).write.bind(res as any);
         const origEnd = (res as any).end.bind(res as any);
         const chunks: Array<Buffer | string> = [];
@@ -281,7 +266,6 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             (res as any).json = mark('res.json', (res as any).json);
 
             res.on('finish', () => {
-                // If nothing captured via json/send, try assembled chunks
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -289,13 +273,11 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                // Pull the call sequence from ALS
                 const ctx = getCtx() as Ctx;
                 const sequence = (ctx.calls || [])
                     .filter(c => c.phase === 'enter')
                     .map(c => c.name);
 
-                // Unconditional per-request summary log:
                 console.log('[repro] trace sequence', {
                     key,
                     status: res.statusCode,
@@ -312,7 +294,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             path: pathUrl,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: {},               // (optional) include sanitized headers if desired
+                            headers: {},
                             key,
                             respBody: capturedBody,
                             trace: { sequence },
@@ -328,7 +310,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 }
 
 // ===================================================================
-// Mongo collection resolvers & helpers (from your original code)
+// Mongo collection resolvers & helpers
 // ===================================================================
 function getCollectionNameFromDoc(doc: any): string | undefined {
     const direct =
@@ -390,7 +372,7 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 // Mongoose plugin — original behavior + one-time call logging patches
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
-    // Ensure the tracer is installed even if user only calls mongoose.plugin(...)
+    // tracer was already installed at import-time; keep this for safety
     installFunctionTracerOnce();
 
     // One-time Model.create wrapper so "create" shows up clearly
@@ -414,7 +396,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
-
             if ((this as any).$isSubdocument) return next();
 
             let before: any = null;
@@ -741,7 +722,7 @@ function buildMinimalUpdate(before: any, after: any) {
 }
 
 // ===================================================================
-/* SendGrid patch (unchanged) */
+// SendGrid patch (unchanged)
 // ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
