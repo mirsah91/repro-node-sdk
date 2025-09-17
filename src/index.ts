@@ -5,10 +5,9 @@ import type { Schema, Model, Query } from 'mongoose';
 import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
-import * as fs from 'fs';
 
 // ===================================================================
-// Async context
+// Async context for per-request call logs
 // ===================================================================
 type CallEvent = { name: string; t: number; phase: 'enter' | 'exit' };
 type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
@@ -27,12 +26,16 @@ if (!(global as any).__repro_traceEnter) {
     (global as any).__repro_traceEnter = (name: string) => {
         const ctx = getCtx() as Ctx;
         if (ctx && ctx.calls) ctx.calls.push({ name, t: Date.now(), phase: 'enter' });
+        // Unconditional log:
+        // Using a short prefix so it’s easy to grep without flooding with JSON
+        console.log('[repro][enter]', name);
     };
 }
 if (!(global as any).__repro_traceExit) {
     (global as any).__repro_traceExit = () => {
         const ctx = getCtx() as Ctx;
         if (ctx && ctx.calls) ctx.calls.push({ name: '<exit>', t: Date.now(), phase: 'exit' });
+        console.log('[repro][exit]');
     };
 }
 
@@ -44,7 +47,7 @@ if (!(global as any).__repro_traceExit) {
    - Injects:
        __repro_traceEnter("<functionName>");
        try { ...original... } finally { __repro_traceExit(); }
-   - Names: attempts best-effort extraction; falls back to <anonymous>.
+   - Names: best-effort extraction; falls back to <anonymous>.
 */
 let TRACE_INSTALLED = false;
 function installFunctionTracerOnce() {
@@ -59,9 +62,8 @@ function installFunctionTracerOnce() {
         generator = require('@babel/generator').default;
         t = require('@babel/types');
     } catch (e) {
-        // eslint-disable-next-line no-console
         console.warn(
-            '[repro] function-call tracer disabled: please `npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save`'
+            '[repro] function-call tracer unavailable: please `npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save`'
         );
         return;
     }
@@ -84,8 +86,7 @@ function installFunctionTracerOnce() {
         // function foo() {}
         if (t.isFunctionDeclaration(n) && n.id?.name) return n.id.name;
 
-        // const foo = () => {}
-        // const foo = function() {}
+        // const foo = () => {} / const foo = function() {}
         if (t.isVariableDeclarator(p.parent) && t.isIdentifier(p.parent.id)) {
             return p.parent.id.name;
         }
@@ -96,7 +97,6 @@ function installFunctionTracerOnce() {
         // obj = { foo() {} }
         if (t.isObjectProperty(p.parent) && t.isIdentifier(p.parent.key)) return p.parent.key.name;
 
-        // fallback
         return '<anonymous>';
     }
 
@@ -109,10 +109,9 @@ function installFunctionTracerOnce() {
         }
 
         const body: any = p.node.body;
-        if (!t.isBlockStatement(body)) return; // unexpected but keep safe
+        if (!t.isBlockStatement(body)) return;
 
         if (!alreadyTagged(p.node)) {
-            // Mark
             (p.node.leadingComments || (p.node.leadingComments = [])).push(
                 t.commentLine(' @repro_instrumented ')
             );
@@ -136,12 +135,13 @@ function installFunctionTracerOnce() {
         }
     }
 
-    const transform = (code: string, filename: string): string => {
+    const transform = (code: string): string => {
         try {
             const ast = parser.parse(code, {
                 sourceType: 'unambiguous',
                 plugins: [
                     'jsx',
+                    'typescript',
                     'classProperties',
                     'classPrivateProperties',
                     'classPrivateMethods',
@@ -149,7 +149,6 @@ function installFunctionTracerOnce() {
                     'optionalChaining',
                     'nullishCoalescingOperator',
                     'topLevelAwait',
-                    // add more as needed
                 ],
             });
 
@@ -163,22 +162,21 @@ function installFunctionTracerOnce() {
 
             const out = generator(ast, { retainLines: true, compact: false, comments: true }, code);
             return out.code;
-        } catch (e) {
-            // In case of parse/transform error, just return original.
+        } catch {
+            // On parse/transform error, keep original code.
             return code;
         }
     };
 
     pirates.addHook(
-        (code: string, filename: string) => transform(code, filename),
+        (code: string) => transform(code),
         {
-            exts: ['.js', '.cjs', '.mjs'],
+            exts: ['.js', '.cjs', '.mjs', '.ts', '.tsx'],
             matcher: (filename: string) => isFromApp(filename),
-            ignoreNodeModules: false, // we manually ignore inside matcher
+            ignoreNodeModules: false,
         }
     );
 
-    // eslint-disable-next-line no-console
     console.log('[repro] function-call tracer installed');
 }
 
@@ -197,13 +195,11 @@ async function post(apiBase: string, appId: string, appSecret: string, sessionId
 
 // -------- helpers for response capture & grouping --------
 function normalizeRouteKey(method: string, rawPath: string) {
-    // strip query string to stabilize grouping across re-loads
     const base = (rawPath || '/').split('?')[0] || '/';
     return `${String(method || 'GET').toUpperCase()} ${base}`;
 }
 
 function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
-    // If already an object/array, store as-is
     if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
 
     const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
@@ -218,16 +214,14 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
             return isLikelyJson ? JSON.parse(body) : body;
         }
     } catch {
-        // fall through to raw string if JSON parse fails
         if (Buffer.isBuffer(body)) return body.toString('utf8');
         if (typeof body === 'string') return body;
     }
-    // last resort
     return body;
 }
 
 // ===================================================================
-// reproMiddleware — captures respBody, key, and now the per-request function-call sequence
+// reproMiddleware — captures respBody, key, and per-request function-call sequence
 // ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
     // Ensure the tracer is installed once in the process
@@ -240,8 +234,8 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 
         const t0 = Date.now();
         const rid = String(t0);
-        const url = (req as any).originalUrl || req.url || '/'; // send as 'url'
-        const pathUrl = url;                                     // keep 'path' for back-compat
+        const url = (req as any).originalUrl || req.url || '/';
+        const pathUrl = url;
         const key = normalizeRouteKey(req.method, url);
 
         // ---- Capture response body robustly (json/send/write/end) ----
@@ -276,8 +270,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 
         // Run the request under ALS, with a per-request call buffer
         als.run({ sid, aid, calls: [] }, () => {
-            // Decorate some well-known functions to appear in the sequence with friendly names
-            // (These wrappers just add a named enter/exit around the original)
+            // Tag res.json so it appears as a friendly step in the sequence
             const mark = (name: string, fn: Function) => {
                 return function wrapped(this: any, ...args: any[]) {
                     (global as any).__repro_traceEnter(name);
@@ -285,7 +278,6 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     finally { (global as any).__repro_traceExit(); }
                 };
             };
-            // res.json marker (many apps return via json)
             (res as any).json = mark('res.json', (res as any).json);
 
             res.on('finish', () => {
@@ -303,6 +295,13 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     .filter(c => c.phase === 'enter')
                     .map(c => c.name);
 
+                // Unconditional per-request summary log:
+                console.log('[repro] trace sequence', {
+                    key,
+                    status: res.statusCode,
+                    sequence,
+                });
+
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
@@ -313,10 +312,10 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             path: pathUrl,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: {},               // (optional) sanitize & include if desired
+                            headers: {},               // (optional) include sanitized headers if desired
                             key,
                             respBody: capturedBody,
-                            trace: { sequence },       // <-- NEW: ordered function call names
+                            trace: { sequence },
                         },
                         t: Date.now(),
                     }]
@@ -332,7 +331,6 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 // Mongo collection resolvers & helpers (from your original code)
 // ===================================================================
 function getCollectionNameFromDoc(doc: any): string | undefined {
-    // Prefer internal collection (Mongoose 8)
     const direct =
         doc?.$__?.collection?.collectionName ||
         (doc?.$collection as any)?.collectionName ||
@@ -342,7 +340,6 @@ function getCollectionNameFromDoc(doc: any): string | undefined {
 
     if (direct) return direct;
 
-    // Subdocument? Try ownerDocument()
     if (doc?.$isSubdocument && typeof (doc as any).ownerDocument === 'function') {
         const parent = (doc as any).ownerDocument();
         return (
@@ -354,7 +351,6 @@ function getCollectionNameFromDoc(doc: any): string | undefined {
         );
     }
 
-    // Discriminator child may have baseModelName
     const ctor = doc?.constructor as any;
     if (ctor?.base && ctor?.base?.collection?.collectionName) {
         return ctor.base.collection.collectionName;
@@ -383,7 +379,6 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
                     ? (source?.constructor as any)?.modelName ||
                     (source?.ownerDocument?.() as any)?.constructor?.modelName
                     : source?.model?.modelName;
-            // eslint-disable-next-line no-console
             console.warn('[repro] could not resolve collection name', { type, modelName });
         } catch { /* noop */ }
         return 'unknown';
@@ -392,11 +387,27 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 }
 
 // ===================================================================
-// Mongoose plugin — unchanged logic, plus: ensure tracer is installed once
+// Mongoose plugin — original behavior + one-time call logging patches
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     // Ensure the tracer is installed even if user only calls mongoose.plugin(...)
     installFunctionTracerOnce();
+
+    // One-time Model.create wrapper so "create" shows up clearly
+    if (!(mongoose as any).__repro_model_calllog_patched) {
+        (mongoose as any).__repro_model_calllog_patched = true;
+        const origCreate = (mongoose as any).Model?.create;
+        if (origCreate) {
+            (mongoose as any).Model.create = async function patchedCreate(this: Model<any>, ...args: any[]) {
+                (global as any).__repro_traceEnter('Model.create');
+                try {
+                    return await origCreate.apply(this, args as any);
+                } finally {
+                    (global as any).__repro_traceExit();
+                }
+            };
+        }
+    }
 
     return function (schema: Schema) {
         // PRE: save
@@ -404,7 +415,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
 
-            // Skip embedded subdocuments — they don't have their own collection
             if ((this as any).$isSubdocument) return next();
 
             let before: any = null;
@@ -434,7 +444,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const after = (this as any).toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
 
-            // NEW: always emit a query
             const query = meta.wasNew
                 ? { op: 'insertOne', doc: after }
                 : { filter: { _id: (this as any)._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
@@ -503,7 +512,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 const filter = (this as any).getFilter();
                 (this as any).__repro_before = await ((this as any).model as Model<any>).findOne(filter).lean().exec();
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
-                (this as any).__repro_filter = filter; // <-- keep filter
+                (this as any).__repro_filter = filter;
             } catch { /* noop */ }
             next();
         });
@@ -514,8 +523,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-            const filter = (this as any).__repro_filter ?? { _id: before._id }; // fallback
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
+            const filter = (this as any).__repro_filter ?? { _id: before._id };
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{
@@ -524,7 +533,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         before,
                         after: null,
                         op: 'delete',
-                        query: { filter },     // <-- add query
+                        query: { filter },
                     }],
                     t: Date.now()
                 }]
@@ -539,14 +548,11 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const origExec = Q?.exec;
             const origAggExec = Agg?.exec;
 
-            // Patch Query.exec for all model ops (find, findOne, update*, delete*, count*, etc.)
             if (origExec) {
                 Q.exec = async function patchedExec(this: any, ...args: any[]) {
                     const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
-                    let error: any = null;
 
-                    // gather query facts up front
                     const collection = this?.model?.collection?.name || 'unknown';
                     const op = String(this?.op || this?.mquery?.op || 'query');
                     const filter = safeJson(this.getFilter?.() ?? this._conditions ?? undefined);
@@ -556,7 +562,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 
                     try {
                         const res = await origExec.apply(this, args);
-                        // summarize result (don’t serialize large docs)
                         const resultMeta = summarizeQueryResult(op, res);
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op,
@@ -567,21 +572,19 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         });
                         return res;
                     } catch (e: any) {
-                        error = { message: e?.message, code: e?.code };
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op,
                             query: { filter, update, projection, options },
                             resultMeta: undefined,
                             durMs: Date.now() - t0,
                             t: Date.now(),
-                            error,
+                            error: { message: e?.message, code: e?.code },
                         });
                         throw e;
                     }
                 };
             }
 
-            // Patch Aggregate.exec
             if (origAggExec) {
                 Agg.exec = async function patchedAggExec(this: any, ...args: any[]) {
                     const { sid, aid } = getCtx() as Ctx;
@@ -601,21 +604,19 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         });
                         return res;
                     } catch (e: any) {
-                        const error = { message: e?.message, code: e?.code };
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op,
                             query: { pipeline },
                             resultMeta: undefined,
                             durMs: Date.now() - t0,
                             t: Date.now(),
-                            error,
+                            error: { message: e?.message, code: e?.code },
                         });
                         throw e;
                     }
                 };
             }
 
-            // Patch Model.bulkWrite
             const origBulkWrite = (mongoose as any).Model?.bulkWrite;
             if (origBulkWrite) {
                 (mongoose as any).Model.bulkWrite = async function patchedBulkWrite(this: Model<any>, ops: any[], options?: any) {
@@ -634,14 +635,13 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         });
                         return res;
                     } catch (e: any) {
-                        const error = { message: e?.message, code: e?.code };
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op: 'bulkWrite',
                             query: { bulk: safeJson(ops), options: safeJson(options) },
                             resultMeta: undefined,
                             durMs: Date.now() - t0,
                             t: Date.now(),
-                            error,
+                            error: { message: e?.message, code: e?.code },
                         });
                         throw e;
                     }
@@ -652,14 +652,12 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 }
 
 function summarizeQueryResult(op: string, res: any) {
-    // reads
     if (op === 'find' || op === 'findOne' || op === 'aggregate' || op.startsWith('count')) {
         if (Array.isArray(res)) return { docsCount: res.length };
         if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') return { docsCount: undefined };
         if (res == null) return { docsCount: 0 };
         return { docsCount: 1 };
     }
-    // writes
     return pickWriteStats(res);
 }
 
@@ -693,11 +691,9 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
             db: [{
                 collection: payload.collection,
                 op: payload.op,
-                // New fields; server will accept them
                 query: payload.query ?? undefined,
                 resultMeta: payload.resultMeta ?? undefined,
                 durMs: payload.durMs ?? undefined,
-                // keep document-diff fields null for pure queries
                 pk: null, before: null, after: null,
                 error: payload.error ?? undefined,
             }],
@@ -745,7 +741,7 @@ function buildMinimalUpdate(before: any, after: any) {
 }
 
 // ===================================================================
-// SendGrid patch (unchanged, just here for completeness)
+/* SendGrid patch (unchanged) */
 // ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
