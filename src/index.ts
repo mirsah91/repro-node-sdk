@@ -82,9 +82,8 @@ function patchExpressOnce() {
     const wrapFn = (name: string, fn: Function) => {
         if (typeof fn !== 'function') return fn;
         const wrapped = function wrapped(this: any, ...args: any[]) {
-            (global as any).__repro_traceEnter(name);
             try { return fn.apply(this, args); }
-            finally { (global as any).__repro_traceExit(); }
+            finally {  }
         };
         try { Object.defineProperty(wrapped, 'name', { value: name, configurable: true }); } catch {}
         return wrapped;
@@ -151,8 +150,7 @@ function patchConsoleOnce() {
             } catch {}
 
             if (!skip && caller) {
-                try { (global as any).__repro_traceEnter(caller); } catch {}
-                try { /* no-op */ } finally { try { (global as any).__repro_traceExit(); } catch {} }
+                try { /* no-op */ } finally { try {  } catch {} }
             }
             return (orig as any).apply(this, args);
         };
@@ -448,9 +446,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         const origCreate = (mongoose as any).Model?.create;
         if (origCreate) {
             (mongoose as any).Model.create = async function patchedCreate(this: Model<any>, ...args: any[]) {
-                (global as any).__repro_traceEnter('Model.create');
                 try { return await origCreate.apply(this, args as any); }
-                finally { (global as any).__repro_traceExit(); }
+                finally {  }
             };
         }
     }
