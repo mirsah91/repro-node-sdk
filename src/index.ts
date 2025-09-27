@@ -38,7 +38,6 @@ let tracerPkg: TracerApi;
 
     const include: RegExp[] = [ projectNoNodeModules ];
     if (expressDir)  include.push(new RegExp('^' + escapeRx(expressDir)  + '/'));
-    if (mongooseDir) include.push(new RegExp('^' + escapeRx(mongooseDir) + '/'));
 
     const exclude: RegExp[] = [
         new RegExp('^' + escapeRx(sdkRoot) + '/'),     // don't instrument the SDK itself
@@ -441,18 +440,65 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 }
 
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
+    // --- tracer API (prefer the bundled tracer; fallback to global __trace) ---
+    const tracerApi: any = (() => {
+        try { return require('./tracer').tracer; } catch { return (global as any).__trace; }
+    })();
+
+    // resolve "node_modules/mongoose/..." file paths so runtime filter treats these as dep top-level calls
+    const modelFile = (() => {
+        try { return path.join(path.dirname(require.resolve('mongoose/package.json')), 'lib', 'model.js').replace(/\\/g, '/'); }
+        catch { return 'node_modules/mongoose/lib/model.js'; }
+    })();
+    const queryFile = (() => {
+        try { return path.join(path.dirname(require.resolve('mongoose/package.json')), 'lib', 'query.js').replace(/\\/g, '/'); }
+        catch { return 'node_modules/mongoose/lib/query.js'; }
+    })();
+    const aggFile = (() => {
+        try { return path.join(path.dirname(require.resolve('mongoose/package.json')), 'lib', 'aggregate.js').replace(/\\/g, '/'); }
+        catch { return 'node_modules/mongoose/lib/aggregate.js'; }
+    })();
+
+    const enter = (name: string, file: string) => { try { tracerApi?.enter?.(name, { file, line: null }); } catch {} };
+    const exit  = (name: string, file: string) => { try { tracerApi?.exit?.({ fn: name, file, line: null }); } catch {} };
+
+    // -----------------------------------------------------------------------
+    // Global, one-time top-level method patches (create/bulkWrite, etc.)
+    // -----------------------------------------------------------------------
     if (!(mongoose as any).__repro_model_calllog_patched) {
         (mongoose as any).__repro_model_calllog_patched = true;
-        const origCreate = (mongoose as any).Model?.create;
-        if (origCreate) {
-            (mongoose as any).Model.create = async function patchedCreate(this: Model<any>, ...args: any[]) {
-                try { return await origCreate.apply(this, args as any); }
-                finally {  }
+
+        const S = Symbol.for('__repro_top_patch_guard');
+
+        // helper to patch async static methods on Model
+        const wrapModelAsyncTop = (obj: any, name: string) => {
+            const orig = obj?.[name];
+            if (typeof orig !== 'function' || (orig as any)?.[S]) return;
+            const wrapped = async function patchedTopLevel(this: Model<any>, ...args: any[]) {
+                enter(name, modelFile);
+                try { return await orig.apply(this, args as any); }
+                finally { exit(name, modelFile); }
             };
+            (wrapped as any)[S] = true;
+            obj[name] = wrapped;
+        };
+
+        // MUST-HAVE: create
+        if ((mongoose as any).Model) {
+            wrapModelAsyncTop((mongoose as any).Model, 'create');
+            // Add more as needed:
+            // wrapModelAsyncTop((mongoose as any).Model, 'insertMany');
+            // wrapModelAsyncTop((mongoose as any).Model, 'deleteMany');
+            // wrapModelAsyncTop((mongoose as any).Model, 'updateOne');
+            // wrapModelAsyncTop((mongoose as any).Model, 'updateMany');
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Per-schema hooks (your existing logic) + query/aggregate exec patches
+    // -----------------------------------------------------------------------
     return function (schema: Schema) {
+        // -------- pre/post save (unchanged, except kept as-is) --------
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
@@ -492,6 +538,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
+        // -------- findOneAndUpdate capture (unchanged) --------
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
@@ -523,6 +570,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
+        // -------- deleteOne capture (unchanged) --------
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
             const { sid, aid } = getCtx() as Ctx; if (!sid || !aid) return next();
             try {
@@ -549,6 +597,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
+        // -------- query/aggregate/bulkwrite top-level tracer events + your capture --------
         if (!(mongoose as any).__repro_query_patched) {
             (mongoose as any).__repro_query_patched = true;
 
@@ -568,6 +617,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const projection = safeJson(this.projection?.() ?? this._fields ?? undefined);
                     const options = safeJson(this.getOptions?.() ?? this.options ?? undefined);
 
+                    // TRACER: show one top-level dep call "exec"
+                    enter('exec', queryFile);
                     try {
                         const res = await origExec.apply(this, args);
                         const resultMeta = summarizeQueryResult(op, res);
@@ -576,6 +627,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     } catch (e: any) {
                         if (sid) emitDbQuery(cfg, sid, aid, { collection, op, query: { filter, update, projection, options }, resultMeta: undefined, durMs: Date.now() - t0, t: Date.now(), error: { message: e?.message, code: e?.code } });
                         throw e;
+                    } finally {
+                        exit('exec', queryFile);
                     }
                 };
             }
@@ -587,6 +640,9 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const collection = this?.model?.collection?.name || 'unknown';
                     const op = 'aggregate';
                     const pipeline = safeJson(this?.pipeline?.() ?? this?._pipeline ?? this?.pipeline ?? undefined);
+
+                    // TRACER: show one top-level dep call "exec"
+                    enter('exec', aggFile);
                     try {
                         const res = await origAggExec.apply(this, args);
                         const resultMeta = summarizeQueryResult(op, res);
@@ -595,6 +651,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     } catch (e: any) {
                         if (sid) emitDbQuery(cfg, sid, aid, { collection, op, query: { pipeline }, resultMeta: undefined, durMs: Date.now() - t0, t: Date.now(), error: { message: e?.message, code: e?.code } });
                         throw e;
+                    } finally {
+                        exit('exec', aggFile);
                     }
                 };
             }
@@ -605,6 +663,9 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
                     const collection = (this as any)?.collection?.name || 'unknown';
+
+                    // TRACER: show one top-level dep call "bulkWrite"
+                    enter('bulkWrite', modelFile);
                     try {
                         const res = await origBulkWrite.apply(this, [ops, options]);
                         const resultMeta = summarizeBulkResult(res);
@@ -613,6 +674,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     } catch (e: any) {
                         if (sid) emitDbQuery(cfg, sid, aid, { collection, op: 'bulkWrite', query: { bulk: safeJson(ops), options: safeJson(options) }, resultMeta: undefined, durMs: Date.now() - t0, t: Date.now(), error: { message: e?.message, code: e?.code } });
                         throw e;
+                    } finally {
+                        exit('bulkWrite', modelFile);
                     }
                 };
             }
