@@ -216,10 +216,16 @@ async function printV8(){ const p=await stopV8(); const s=summarize(p);
     }
 }
 
+function getCurrentTraceId() {
+    const s = als.getStore();
+    return s && s.traceId || null;
+}
+
 module.exports = {
     trace,
     patchHttp,
     startV8,
     printV8,
-    patchConsole
+    patchConsole,
+    getCurrentTraceId
 };

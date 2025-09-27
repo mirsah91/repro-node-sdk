@@ -1,6 +1,13 @@
 // index.js
 
-const { trace, patchHttp, startV8, printV8, patchConsole } = require('./runtime');
+const {
+    trace,
+    patchHttp,
+    startV8,
+    printV8,
+    patchConsole,
+    getCurrentTraceId
+} = require('./runtime');
 const { installCJS } = require('./cjs-hook');
 
 let INIT = false;
@@ -39,5 +46,12 @@ function init(opts = {}) {
     return api();
 }
 
-function api(){ return { init, tracer: trace, withTrace: trace.withTrace }; }
+function api(){
+    return {
+        init,
+        tracer: trace,
+        withTrace: trace.withTrace,
+        getCurrentTraceId,
+    };
+}
 module.exports = api();

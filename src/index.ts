@@ -6,6 +6,57 @@ import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
 
+// ---- tracer auto-init (no client -r needed) ------------------------
+type TracerApi = {
+    init: (opts: any) => any;
+    tracer: { on: (fn: (ev: any) => void) => () => void };
+    getCurrentTraceId?: () => string | null;
+};
+
+function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function safeResolveDir(mod: string): string | null {
+    try { return path.dirname(require.resolve(mod + '/package.json')).replace(/\\/g, '/'); }
+    catch { return null; }
+}
+
+let __TRACER_READY = false;
+let tracerPkg: TracerApi;
+
+(function ensureTracerInstalledOnce() {
+    if (__TRACER_READY) return;
+
+    // require your bundled tracer (folder in this package root)
+    tracerPkg = require('../tracer') as TracerApi;
+
+    const cwd = process.cwd().replace(/\\/g, '/');
+    const sdkRoot = __dirname.replace(/\\/g, '/');
+
+    // instrument: app code (exclude its node_modules), + targeted deps
+    const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
+    const expressDir = safeResolveDir('express');
+    const mongooseDir = safeResolveDir('mongoose');
+
+    const include: RegExp[] = [ projectNoNodeModules ];
+    if (expressDir)  include.push(new RegExp('^' + escapeRx(expressDir)  + '/'));
+    if (mongooseDir) include.push(new RegExp('^' + escapeRx(mongooseDir) + '/'));
+
+    const exclude: RegExp[] = [
+        new RegExp('^' + escapeRx(sdkRoot) + '/'),     // don't instrument the SDK itself
+        /node_modules[\\/]@babel[\\/].*/,              // never touch Babel internals
+    ];
+
+    // start tracer (idempotent inside tracer)
+    tracerPkg.init({
+        instrument: true,
+        mode: process.env.TRACE_MODE || 'v8',
+        samplingMs: 10,
+        include,
+        exclude,
+    });
+
+    __TRACER_READY = true;
+})();
+
 type CallEvent = { name: string; t: number; phase: 'enter' | 'exit' };
 type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
 const als = new AsyncLocalStorage<Ctx>();
@@ -290,6 +341,12 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
 // ===================================================================
 // reproMiddleware — captures respBody + per-request call sequence + full trace
 // ===================================================================
+// ===================================================================
+// reproMiddleware — capture respBody + per-request tracer events
+// ===================================================================
+// ===================================================================
+// reproMiddleware — capture respBody + per-request tracer events
+// ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
@@ -301,9 +358,8 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         const url = (req as any).originalUrl || req.url || '/';
         const key = normalizeRouteKey(req.method, url);
 
+        // --- capture response body (unchanged) ---
         let capturedBody: any = undefined;
-
-        // capture JSON & send()
         const origJson = res.json.bind(res as any);
         (res as any).json = (body: any) => { capturedBody = body; return origJson(body); };
         const origSend = res.send.bind(res as any);
@@ -311,22 +367,31 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             if (capturedBody === undefined) capturedBody = coerceBodyToStorable(body, res.getHeader?.('content-type'));
             return origSend(body);
         };
-
-        // capture streamed body
         const origWrite = (res as any).write.bind(res as any);
         const origEnd = (res as any).end.bind(res as any);
         const chunks: Array<Buffer | string> = [];
         (res as any).write = (chunk: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origWrite(chunk, ...args); };
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
+        // Keep sid/aid in our ALS (independent of tracer’s ALS)
         als.run({ sid, aid, calls: [] }, () => {
-            // ensure res.json itself shows up in the call list
-            const mark = (name: string, fn: Function) =>
-                function wrapped(this: any, ...args: any[]) { (global as any).__repro_traceEnter(name); try { return fn.apply(this, args); } finally { (global as any).__repro_traceExit(); } };
-            (res as any).json = mark('res.json', (res as any).json);
+            // Subscribe to tracer events for THIS request's traceId
+            const curTid: string | null = typeof tracerPkg.getCurrentTraceId === 'function'
+                ? tracerPkg.getCurrentTraceId()
+                : null;
+
+            const eventBuf: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
+            let unsubscribe: undefined | (() => void);
+
+            if (curTid && tracerPkg.tracer && typeof tracerPkg.tracer.on === 'function') {
+                unsubscribe = tracerPkg.tracer.on((ev: any) => {
+                    if (ev && ev.traceId === curTid) {
+                        eventBuf.push({ t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth });
+                    }
+                });
+            }
 
             res.on('finish', () => {
-                // finalize response body if only streamed
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -334,18 +399,15 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                // pull call data from ALS
-                const ctx = getCtx() as Ctx;
-                const calls = Array.isArray(ctx.calls) ? ctx.calls : [];
-                // keep the easy human-readable sequence of function names
-                const sequence = calls.filter(c => c.phase === 'enter').map(c => c.name);
-                // and also send the **full raw trace** as a STRING (your request)
-                let trace = '[]';
-                try { trace = JSON.stringify(calls); } catch { /* fallback already set */ }
+                // Compact sequence (optional)
+                const sequence = eventBuf.filter(e => e.type === 'enter').map(e => e.fn || '');
+
+                // REQUIRED: send full trace as STRING
+                let traceStr = '[]';
+                try { traceStr = JSON.stringify(eventBuf); } catch {}
 
                 logLine(`[repro] trace sequence ${JSON.stringify({ key, status: res.statusCode, sequence })}`);
 
-                // send everything
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
@@ -359,13 +421,13 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             headers: {},
                             key,
                             respBody: capturedBody,
-                            // NEW: include both
-                            trace,               // <-- full call list as a STRING
-                            sequence,            // <-- keep your sequence too (optional)
+                            trace: traceStr,   // <— the tracer data as a STRING
                         },
                         t: Date.now(),
                     }]
                 });
+
+                try { unsubscribe && unsubscribe(); } catch {}
             });
 
             next();
