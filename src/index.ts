@@ -66,28 +66,6 @@ function logLine(s: string) {
     try { process.stdout.write(s + '\n'); } catch {}
 }
 
-// ---- global tracer helpers (use stdout, NOT console, to avoid recursion)
-declare global {
-    // eslint-disable-next-line no-var
-    var __repro_traceEnter: (name: string) => void;
-    // eslint-disable-next-line no-var
-    var __repro_traceExit: () => void;
-}
-if (!(global as any).__repro_traceEnter) {
-    (global as any).__repro_traceEnter = (name: string) => {
-        const ctx = getCtx() as Ctx;
-        if (ctx && ctx.calls) ctx.calls.push({ name, t: Date.now(), phase: 'enter' });
-        logLine(`[repro][enter] ${name}`);
-    };
-}
-if (!(global as any).__repro_traceExit) {
-    (global as any).__repro_traceExit = () => {
-        const ctx = getCtx() as Ctx;
-        if (ctx && ctx.calls) ctx.calls.push({ name: '<exit>', t: Date.now(), phase: 'exit' });
-        logLine(`[repro][exit]`);
-    };
-}
-
 // ===================================================================
 // EXPRESS GLOBAL PATCH — wrap all handlers so they show in trace
 // ===================================================================
