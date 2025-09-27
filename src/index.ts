@@ -62,10 +62,6 @@ type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
-function logLine(s: string) {
-    try { process.stdout.write(s + '\n'); } catch {}
-}
-
 // ===================================================================
 // EXPRESS GLOBAL PATCH — wrap all handlers so they show in trace
 // ===================================================================
@@ -119,8 +115,6 @@ function patchExpressOnce() {
             return orig.apply(this, rebuilt);
         };
     }
-
-    logLine('[repro] express router patched for call tracing');
 }
 patchExpressOnce();
 
@@ -169,8 +163,6 @@ function patchConsoleOnce() {
     c.warn  = mk(c.warn);
     c.error = mk(c.error);
     c.debug = mk(c.debug ?? c.log);
-    // NOTE: we do NOT log here via console to avoid self-capture
-    logLine('[repro] console patched for call tracing');
 }
 patchConsoleOnce();
 
@@ -194,7 +186,6 @@ function installFunctionTracerOnce() {
         generator = require('@babel/generator').default;
         t = require('@babel/types');
     } catch {
-        logLine('[repro] function-call tracer unavailable: npm i pirates @babel/core @babel/parser @babel/traverse @babel/generator @babel/types --save');
         return;
     }
 
@@ -272,12 +263,7 @@ function installFunctionTracerOnce() {
         { exts: ['.js','.cjs','.mjs','.ts','.tsx'], matcher: (filename: string) => isFromApp(filename), ignoreNodeModules: false }
     );
 
-    logLine('[repro] function-call tracer installed');
-
     const preloaded = loadedAppFiles.filter(f => !f.startsWith(pkgDir)).slice(0, 5);
-    if (preloaded.length) {
-        logLine('[repro] tracer installed after some app files were loaded. Move your SDK import earlier so functions inside these files are traced: ' + JSON.stringify(preloaded));
-    }
 }
 installFunctionTracerOnce();
 
@@ -384,8 +370,6 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                 let traceStr = '[]';
                 try { traceStr = JSON.stringify(eventBuf); } catch {}
 
-                logLine(`[repro] trace sequence ${JSON.stringify({ key, status: res.statusCode, sequence })}`);
-
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
@@ -452,7 +436,6 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
                 type === 'doc'
                     ? (source?.constructor as any)?.modelName || (source?.ownerDocument?.() as any)?.constructor?.modelName
                     : source?.model?.modelName;
-            logLine('[repro] could not resolve collection name ' + JSON.stringify({ type, modelName }));
         } catch {}
         return 'unknown';
     }
