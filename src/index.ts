@@ -19,9 +19,7 @@ let __TRACER_READY = false;
 
 (function ensureTracerAutoInit() {
     if (__TRACER_READY) return;
-
     try {
-        // load your bundled tracer (kept inside this package)
         const tracerPkg: TracerApi = require('../tracer');
 
         const cwd = process.cwd().replace(/\\/g, '/');
@@ -37,7 +35,7 @@ let __TRACER_READY = false;
         ];
 
         tracerPkg.init?.({
-            instrument: true,              // your tracer stays active
+            instrument: true,
             include,
             exclude,
             mode: process.env.TRACE_MODE || 'v8',
@@ -50,8 +48,7 @@ let __TRACER_READY = false;
         __TRACER__ = tracerPkg;
         __TRACER_READY = true;
     } catch {
-        // tracer not bundled or optional — keep functioning without it
-        __TRACER__ = null;
+        __TRACER__ = null; // optional tracer
     }
 })();
 // ===================================================================
@@ -194,12 +191,10 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             try {
                 if (__TRACER__?.tracer?.on) {
                     const getTid = __TRACER__?.getCurrentTraceId;
-                    // tracer’s http patch establishes the traceId before middleware runs
                     const tidNow = getTid ? getTid() : null;
 
                     if (tidNow) {
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
-                            // match only THIS request’s events; ignore everything else
                             if (ev && ev.traceId === tidNow) {
                                 events.push({
                                     t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth
@@ -234,7 +229,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             headers: {},
                             key,
                             respBody: capturedBody,
-                            trace: traceStr,  // <- tracer data as string
+                            trace: traceStr,
                         },
                         t: Date.now(),
                     }]
@@ -250,7 +245,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 
 // ===================================================================
 // reproMongoosePlugin — stable implementation + NON-intrusive query logs
-//   - NO prototype monkey-patching
+//   - NO prototype monkey-patching of Mongoose (no Query.exec / Aggregate.exec / Model.bulkWrite overrides)
 //   - ONLY schema middleware (pre/post) for specific ops
 //   - keeps your existing doc-diff hooks (save / findOneAndUpdate / deleteOne)
 // ===================================================================
@@ -308,7 +303,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 const filter = this.getFilter();
                 const model = this.model as Model<any>;
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
-                this.setOptions({ new: true }); // keep your stable behavior
+                this.setOptions({ new: true });
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
             } catch {}
             next();
@@ -360,7 +355,8 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         });
 
         // -------- NON-intrusive generic query telemetry via schema hooks -------
-        // We purposely avoid touching Query.exec / Aggregate.exec / Model.bulkWrite.
+        // No prototype patching. These hooks are passive and do not alter behavior.
+
         const READ_OPS = [
             'find',
             'findOne',
@@ -373,11 +369,9 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             'updateOne',
             'updateMany',
             'replaceOne',
-            // 'deleteOne',  // already handled above with before/after
             'deleteMany',
         ] as const;
 
-        // helper to attach pre/post for a query op
         function attachQueryHooks(op: string) {
             schema.pre(op as any, function (this: any, next: Function) {
                 try {
