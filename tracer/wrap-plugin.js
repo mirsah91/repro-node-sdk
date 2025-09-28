@@ -98,44 +98,84 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
         // ---- NEW: wrap every call-site with __repro_call(...) ----
         function wrapCall(path, state) {
-            const n = path.node;
+            const { node: n } = path;
             if (n.__repro_call_wrapped) return;
 
-            // Don’t wrap our own helper, super() or dynamic import()
+            // Skip our helper, super(), import(), optional calls for now
             if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
-
-            // Optional chaining calls are tricky to preserve exactly; skip for now
-            // (If needed, we can add a nullish check + temp variables.)
             if (n.optional === true) return;
 
-            // Determine thisArg and a friendly label (best-effort)
-            let thisArg = t.nullLiteral();
-            let label = null;
-
-            if (t.isMemberExpression(n.callee)) {
-                thisArg = n.callee.object;
-                if (t.isIdentifier(n.callee.property)) {
-                    label = t.stringLiteral(n.callee.property.name);
-                } else if (t.isStringLiteral(n.callee.property)) {
-                    label = t.stringLiteral(n.callee.property.value);
-                }
-            } else if (t.isIdentifier(n.callee)) {
-                label = t.stringLiteral(n.callee.name);
-            }
-
-            const argsArray = t.arrayExpression(n.arguments); // preserves spreads
             const fileLit = t.stringLiteral(state.file.opts.filename || '');
             const lineLit = t.numericLiteral(n.loc?.start?.line ?? 0);
-            const labelLit = label || t.stringLiteral('');
 
-            const callShim = t.callExpression(
-                t.identifier('__repro_call'),
-                [ n.callee, thisArg, argsArray, fileLit, lineLit, labelLit ]
-            );
+            // Default: no thisArg, label from identifier name if any
+            let labelLit = t.stringLiteral('');
+            let callExpr;
 
-            path.replaceWith(callShim);
+            if (t.isMemberExpression(n.callee)) {
+                // --- Member call: obj.method(...args)
+                // Hoist obj and fn into temps so obj is evaluated ONCE.
+                const objOrig = n.callee.object;
+                const prop = n.callee.property;
+                const computed = n.callee.computed === true;
+
+                const objId = path.scope.generateUidIdentifierBasedOnNode(objOrig, 'obj');
+                const fnId  = path.scope.generateUidIdentifier('fn');
+
+                // label = property name when available
+                if (!computed && t.isIdentifier(prop)) {
+                    labelLit = t.stringLiteral(prop.name);
+                } else if (t.isStringLiteral(prop)) {
+                    labelLit = t.stringLiteral(prop.value);
+                }
+
+                const fnMember = t.memberExpression(objId, prop, computed);
+                const argsArray = t.arrayExpression(n.arguments); // preserves spreads
+
+                const reproCall = t.callExpression(
+                    t.identifier('__repro_call'),
+                    [ fnId, objId, argsArray, fileLit, lineLit, labelLit ]
+                );
+
+                // Build a single expression that:
+                //   const _obj = (origObj), _fn = _obj.prop, __repro_call(_fn, _obj, args, ...)
+                // We use a sequence expression so it works anywhere an expression is allowed.
+                callExpr = t.sequenceExpression([
+                    t.assignmentExpression('=', objId, objOrig),
+                    t.assignmentExpression('=', fnId, fnMember),
+                    reproCall
+                ]);
+
+                // Ensure the temps are declared in the current scope
+                path.scope.push({ id: objId });
+                path.scope.push({ id: fnId });
+            } else {
+                // --- Plain call: fn(...args)
+                // Evaluate callee ONCE into a temp as well (avoids re-evaluation when nested).
+                const fnOrig = n.callee;
+                const fnId = path.scope.generateUidIdentifier('fn');
+                const argsArray = t.arrayExpression(n.arguments);
+
+                if (t.isIdentifier(fnOrig)) {
+                    labelLit = t.stringLiteral(fnOrig.name);
+                }
+
+                const reproCall = t.callExpression(
+                    t.identifier('__repro_call'),
+                    [ fnId, t.nullLiteral(), argsArray, fileLit, lineLit, labelLit ]
+                );
+
+                callExpr = t.sequenceExpression([
+                    t.assignmentExpression('=', fnId, fnOrig),
+                    reproCall
+                ]);
+
+                path.scope.push({ id: fnId });
+            }
+
+            path.replaceWith(callExpr);
             path.node.__repro_call_wrapped = true;
         }
 
