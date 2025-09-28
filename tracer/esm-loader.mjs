@@ -38,8 +38,9 @@ export async function load(url, context, next) {
         sourceType: 'unambiguous',
         retainLines: true,
         parserOpts: { sourceType:'unambiguous', plugins: parserPlugins },
-        plugins: [[ makeWrap(filename) ], [ tsPlugin, { allowDeclareFields:true } ]]
+        plugins: [[ makeWrap(filename) ], [ tsPlugin, { allowDeclareFields:true } ]],
+        sourceMaps: 'inline',
     })?.code || code;
 
-    return { format: 'module', source: out };
+    return { format: r.format, source: out };
 }

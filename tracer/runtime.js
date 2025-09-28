@@ -187,10 +187,8 @@ if (!global.__repro_call) {
                 trace.enter(name, meta);
                 try {
                     const out = fn.apply(thisArg, args);
-                    if (out && typeof out.then === 'function' && typeof out.finally === 'function') {
-                        return out.finally(() =>
-                            trace.exit({ fn: name, file: meta.file, line: meta.line })
-                        );
+                    if (out && typeof out.then === 'function') {
+                        return Promise.resolve(out).finally(() => trace.exit({ fn: name, file: meta.file, line: meta.line }));
                     }
                     trace.exit({ fn: name, file: meta.file, line: meta.line });
                     return out;

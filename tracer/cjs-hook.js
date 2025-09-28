@@ -32,10 +32,10 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
     if (typeof value === 'function') {
         try {
             if (!value[SYM_SRC_FILE]) {
-                Object.defineProperty(value, SYM_SRC_FILE, { value: filename, configurable: false });
+                Object.defineProperty(value, SYM_SRC_FILE, { value: filename, configurable: true });
             }
             if (value[SYM_IS_APP] !== isApp) {
-                Object.defineProperty(value, SYM_IS_APP, { value: isApp, configurable: false });
+                Object.defineProperty(value, SYM_IS_APP, { value: isApp, configurable: true });
             }
         } catch {}
         const proto = value.prototype;
@@ -94,6 +94,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
                         filename,
                         sourceType: 'unambiguous',
                         retainLines: true,
+                        sourceMaps: 'inline',
                         parserOpts: {
                             sourceType: 'unambiguous',
                             plugins: parserPlugins || [
