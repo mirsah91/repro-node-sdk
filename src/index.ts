@@ -506,6 +506,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             'updateMany',
             'replaceOne',
             'deleteMany',
+            'findOneAndUpdate'
         ] as const;
 
         function attachQueryHooks(op: string) {
