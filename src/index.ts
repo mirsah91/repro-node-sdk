@@ -5,6 +5,78 @@ import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
 
+/**
+ * ============================= IMPORTANT =============================
+ * We snapshot Mongoose core methods BEFORE tracer init, then re-apply them
+ * AFTER tracer init. This guarantees Model.find() still returns a Query and
+ * chainability (e.g., .sort().lean()) is preserved. No behavior changes.
+ * =====================================================================
+ */
+const __ORIG = (() => {
+    const M: any = (mongoose as any).Model;
+    const Qp: any = (mongoose as any).Query?.prototype;
+    const Ap: any = (mongoose as any).Aggregate?.prototype;
+    return {
+        Model: {
+            find: M?.find,
+            findOne: M?.findOne,
+            findById: M?.findById,
+            create: M?.create,
+            insertMany: M?.insertMany,
+            updateOne: M?.updateOne,
+            updateMany: M?.updateMany,
+            replaceOne: M?.replaceOne,
+            deleteOne: M?.deleteOne,
+            deleteMany: M?.deleteMany,
+            countDocuments: M?.countDocuments,
+            estimatedDocumentCount: M?.estimatedDocumentCount,
+            distinct: M?.distinct,
+            findOneAndUpdate: M?.findOneAndUpdate,
+            findOneAndDelete: M?.findOneAndDelete,
+            findOneAndReplace: M?.findOneAndReplace,
+            findOneAndRemove: M?.findOneAndRemove,
+            bulkWrite: M?.bulkWrite,
+        },
+        Query: {
+            exec: Qp?.exec,
+            lean: Qp?.lean,
+            sort: Qp?.sort,
+            select: Qp?.select,
+            limit: Qp?.limit,
+            skip: Qp?.skip,
+            populate: Qp?.populate,
+            getFilter: Qp?.getFilter,
+            getUpdate: Qp?.getUpdate,
+            getOptions: Qp?.getOptions,
+            projection: Qp?.projection,
+        },
+        Aggregate: {
+            exec: Ap?.exec,
+        }
+    };
+})();
+
+function restoreMongooseIfNeeded() {
+    try {
+        const M: any = (mongoose as any).Model;
+        const Qp: any = (mongoose as any).Query?.prototype;
+        const Ap: any = (mongoose as any).Aggregate?.prototype;
+        const safeSet = (obj: any, key: string, val: any) => {
+            if (!obj || !val) return;
+            if (obj[key] !== val) { try { obj[key] = val; } catch {} }
+        };
+
+        // Restore Model methods (chainability depends on these returning Query)
+        Object.entries(__ORIG.Model).forEach(([k, v]) => safeSet(M, k, v));
+
+        // Restore Query prototype essentials (exec/lean/etc.)
+        Object.entries(__ORIG.Query).forEach(([k, v]) => safeSet(Qp, k, v));
+
+        // Restore Aggregate exec
+        Object.entries(__ORIG.Aggregate).forEach(([k, v]) => safeSet(Ap, k, v));
+    } catch {}
+}
+
 // ====== tiny, safe tracer auto-init (no node_modules patches) ======
 type TracerApi = {
     init?: (opts: any) => void;
@@ -19,6 +91,7 @@ let __TRACER_READY = false;
 
 (function ensureTracerAutoInit() {
     if (__TRACER_READY) return;
+
     try {
         const tracerPkg: TracerApi = require('../tracer');
 
@@ -28,27 +101,37 @@ let __TRACER_READY = false;
         // include ONLY app code (no node_modules) to avoid interfering with deps
         const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
 
+        // additionally exclude common model/schema folders to be extra safe
+        const extraExcludes = [
+            '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
+        ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
+
         // exclude this SDK itself (and any babel internals if present)
         const exclude = [
             new RegExp('^' + escapeRx(sdkRoot) + '/'),
             /node_modules[\\/]@babel[\\/].*/,
+            ...extraExcludes,
         ];
 
         tracerPkg.init?.({
-            instrument: true,
+            instrument: true,               // tracer can instrument app code
             include,
-            exclude,
+            exclude,                        // but never our SDK or common data/model paths
             mode: process.env.TRACE_MODE || 'v8',
             samplingMs: 10,
         });
 
-        // ensure per-request traceId exists; harmless if tracer already did it
         tracerPkg.patchHttp?.();
 
         __TRACER__ = tracerPkg;
         __TRACER_READY = true;
     } catch {
         __TRACER__ = null; // optional tracer
+    } finally {
+        // Critical: make sure Mongoose core is pristine after tracer init.
+        restoreMongooseIfNeeded();
+        // And again on next tick (if tracer defers some wrapping)
+        setImmediate(restoreMongooseIfNeeded);
     }
 })();
 // ===================================================================
@@ -244,10 +327,10 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 }
 
 // ===================================================================
-// reproMongoosePlugin — stable implementation + NON-intrusive query logs
-//   - NO prototype monkey-patching of Mongoose (no Query.exec / Aggregate.exec / Model.bulkWrite overrides)
+// reproMongoosePlugin — stable + NON-intrusive query logs
+//   - NO prototype monkey-patching of Mongoose
 //   - ONLY schema middleware (pre/post) for specific ops
-//   - keeps your existing doc-diff hooks (save / findOneAndUpdate / deleteOne)
+//   - keeps your existing doc-diff hooks
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
@@ -355,8 +438,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
         });
 
         // -------- NON-intrusive generic query telemetry via schema hooks -------
-        // No prototype patching. These hooks are passive and do not alter behavior.
-
         const READ_OPS = [
             'find',
             'findOne',
