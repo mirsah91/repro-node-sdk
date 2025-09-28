@@ -174,30 +174,65 @@ if (!global.__repro_call) {
                     return fn.apply(thisArg, args);
                 }
 
-                // Tagged by the require hook (cjs-hook): origin of the callee
                 const isApp = fn[SYM_IS_APP] === true;
-
-                // App functions are traced inside their bodies (via AST); avoid double entries.
                 if (isApp) return fn.apply(thisArg, args);
 
-                // Dependency call: emit single top-level event labeled by name or provided label.
                 const name = label || fn.name || '(anonymous)';
                 const meta = { file: callFile || null, line: callLine || null };
 
                 trace.enter(name, meta);
                 try {
                     const out = fn.apply(thisArg, args);
-                    if (out && typeof out.then === 'function') {
-                        if (typeof out.finally === 'function') {
-                            out.finally(() => trace.exit({ fn: name, file: meta.file, line: meta.line }));
-                            return out; // <-- keep the original thenable/query for chaining
+
+                    // --- classify the return value ---
+                    const isThenable = out && typeof out.then === 'function';
+                    const isNativePromise =
+                        typeof Promise !== 'undefined' &&
+                        (out instanceof Promise || out?.[Symbol.toStringTag] === 'Promise');
+
+                    // Heuristic: Mongoose Query (thenable that has .exec and ctor name 'Query')
+                    const isMongooseQuery =
+                        isThenable &&
+                        typeof out.exec === 'function' &&
+                        (out?.constructor?.name === 'Query' || out?.model != null);
+
+                    if (isThenable) {
+                        if (isNativePromise) {
+                            // Safe: attach side-effect, return the ORIGINAL promise
+                            if (typeof out.finally === 'function') {
+                                out.finally(() =>
+                                    trace.exit({ fn: name, file: meta.file, line: meta.line })
+                                );
+                                return out;
+                            }
+                            // Rare thenables that are actually native-ish but no .finally
+                            Promise.resolve(out).finally(() =>
+                                trace.exit({ fn: name, file: meta.file, line: meta.line })
+                            );
+                            return out;
                         }
-                        // rare thenables without finally: attach via Promise.resolve but still return original
-                        Promise.resolve(out).finally(() =>
-                            trace.exit({ fn: name, file: meta.file, line: meta.line })
-                        );
+
+                        if (isMongooseQuery) {
+                            // CRITICAL: do NOT attach handlers; they'd execute the query now.
+                            // Emit exit immediately and return the original thenable Query for chaining.
+                            trace.exit({ fn: name, file: meta.file, line: meta.line });
+                            return out;
+                        }
+
+                        // Generic unknown thenable: don't replace it.
+                        // Try to piggyback without touching its identity; if that throws, at least we emitted enter.
+                        try {
+                            Promise.resolve(out).finally(() =>
+                                trace.exit({ fn: name, file: meta.file, line: meta.line })
+                            );
+                        } catch {
+                            // fallback: immediate exit; better than leaking a span
+                            trace.exit({ fn: name, file: meta.file, line: meta.line });
+                        }
                         return out;
                     }
+
+                    // Non-thenable: close span now
                     trace.exit({ fn: name, file: meta.file, line: meta.line });
                     return out;
                 } catch (e) {
@@ -205,10 +240,7 @@ if (!global.__repro_call) {
                     throw e;
                 }
             } catch {
-                // Never blow up the app due to tracing; just fall back to direct call.
-                if (fn) {
-                    return fn.apply(thisArg, args);
-                }
+                return fn ? fn.apply(thisArg, args) : undefined;
             }
         },
         configurable: false,
