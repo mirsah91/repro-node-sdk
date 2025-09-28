@@ -22,39 +22,39 @@ function safeResolveDir(mod: string): string | null {
 let __TRACER_READY = false;
 let tracerPkg: TracerApi;
 
-// (function ensureTracerInstalledOnce() {
-//     if (__TRACER_READY) return;
-//
-//     // require your bundled tracer (folder in this package root)
-//     tracerPkg = require('../tracer') as TracerApi;
-//
-//     const cwd = process.cwd().replace(/\\/g, '/');
-//     const sdkRoot = __dirname.replace(/\\/g, '/');
-//
-//     // instrument: app code (exclude its node_modules), + targeted deps
-//     const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
-//     const expressDir = safeResolveDir('express');
-//     const mongooseDir = safeResolveDir('mongoose');
-//
-//     const include: RegExp[] = [ projectNoNodeModules ];
-//     if (expressDir)  include.push(new RegExp('^' + escapeRx(expressDir)  + '/'));
-//
-//     const exclude: RegExp[] = [
-//         new RegExp('^' + escapeRx(sdkRoot) + '/'),     // don't instrument the SDK itself
-//         /node_modules[\\/]@babel[\\/].*/,              // never touch Babel internals
-//     ];
-//
-//     // start tracer (idempotent inside tracer)
-//     tracerPkg.init({
-//         instrument: true,
-//         mode: process.env.TRACE_MODE || 'v8',
-//         samplingMs: 10,
-//         include,
-//         exclude,
-//     });
-//
-//     __TRACER_READY = true;
-// })();
+(function ensureTracerInstalledOnce() {
+    if (__TRACER_READY) return;
+
+    // require your bundled tracer (folder in this package root)
+    tracerPkg = require('../tracer') as TracerApi;
+
+    const cwd = process.cwd().replace(/\\/g, '/');
+    const sdkRoot = __dirname.replace(/\\/g, '/');
+
+    // instrument: app code (exclude its node_modules), + targeted deps
+    const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
+    const expressDir = safeResolveDir('express');
+    const mongooseDir = safeResolveDir('mongoose');
+
+    const include: RegExp[] = [ projectNoNodeModules ];
+    if (expressDir)  include.push(new RegExp('^' + escapeRx(expressDir)  + '/'));
+
+    const exclude: RegExp[] = [
+        new RegExp('^' + escapeRx(sdkRoot) + '/'),     // don't instrument the SDK itself
+        /node_modules[\\/]@babel[\\/].*/,              // never touch Babel internals
+    ];
+
+    // start tracer (idempotent inside tracer)
+    tracerPkg.init({
+        instrument: true,
+        mode: process.env.TRACE_MODE || 'v8',
+        samplingMs: 10,
+        include,
+        exclude,
+    });
+
+    __TRACER_READY = true;
+})();
 
 type CallEvent = { name: string; t: number; phase: 'enter' | 'exit' };
 type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
