@@ -188,7 +188,15 @@ if (!global.__repro_call) {
                 try {
                     const out = fn.apply(thisArg, args);
                     if (out && typeof out.then === 'function') {
-                        return Promise.resolve(out).finally(() => trace.exit({ fn: name, file: meta.file, line: meta.line }));
+                        if (typeof out.finally === 'function') {
+                            out.finally(() => trace.exit({ fn: name, file: meta.file, line: meta.line }));
+                            return out; // <-- keep the original thenable/query for chaining
+                        }
+                        // rare thenables without finally: attach via Promise.resolve but still return original
+                        Promise.resolve(out).finally(() =>
+                            trace.exit({ fn: name, file: meta.file, line: meta.line })
+                        );
+                        return out;
                     }
                     trace.exit({ fn: name, file: meta.file, line: meta.line });
                     return out;
