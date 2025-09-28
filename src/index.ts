@@ -1,9 +1,7 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import type { Request, Response, NextFunction } from 'express';
 import type { Schema, Model, Query } from 'mongoose';
 import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
-import * as path from 'path';
 
 /**
  * ============================= IMPORTANT =============================
@@ -89,52 +87,109 @@ function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
 let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
 
-(function ensureTracerAutoInit() {
-    if (__TRACER_READY) return;
+// (function ensureTracerAutoInit() {
+//     if (__TRACER_READY) return;
+//
+//     try {
+//         const tracerPkg: TracerApi = require('../tracer');
+//
+//         const cwd = process.cwd().replace(/\\/g, '/');
+//         const sdkRoot = __dirname.replace(/\\/g, '/');
+//
+//         // include ONLY app code (no node_modules) to avoid interfering with deps
+//         const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
+//
+//         // additionally exclude common model/schema folders to be extra safe
+//         const extraExcludes = [
+//             '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
+//         ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
+//
+//         // exclude this SDK itself (and any babel internals if present)
+//         const exclude = [
+//             new RegExp('^' + escapeRx(sdkRoot) + '/'),
+//             /node_modules[\\/]@babel[\\/].*/,
+//             ...extraExcludes,
+//         ];
+//
+//         tracerPkg.init?.({
+//             instrument: true,               // tracer can instrument app code
+//             include,
+//             exclude,                        // but never our SDK or common data/model paths
+//             mode: process.env.TRACE_MODE || 'v8',
+//             samplingMs: 10,
+//         });
+//
+//         tracerPkg.patchHttp?.();
+//
+//         __TRACER__ = tracerPkg;
+//         __TRACER_READY = true;
+//     } catch {
+//         __TRACER__ = null; // optional tracer
+//     } finally {
+//         // Critical: make sure Mongoose core is pristine after tracer init.
+//         restoreMongooseIfNeeded();
+//         // And again on next tick (if tracer defers some wrapping)
+//         setImmediate(restoreMongooseIfNeeded);
+//     }
+// })();
+// ===================================================================
 
+// ===== Configurable tracer init (explicit, no auto-run) =====
+type TracerInitOpts = {
+    instrument?: boolean;
+    include?: RegExp[];
+    exclude?: RegExp[];
+    mode?: string;
+    samplingMs?: number;
+};
+
+function defaultTracerInitOpts(): TracerInitOpts {
+    const cwd = process.cwd().replace(/\\/g, '/');
+    const sdkRoot = __dirname.replace(/\\/g, '/');
+    const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
+    const extraExcludes = [
+        '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
+    ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
+
+    const exclude = [
+        new RegExp('^' + escapeRx(sdkRoot) + '/'), // never instrument the SDK itself
+        /node_modules[\\/]@babel[\\/].*/,
+        ...extraExcludes,
+    ];
+
+    return {
+        instrument: true,
+        include,
+        exclude,
+        mode: process.env.TRACE_MODE || 'v8',
+        samplingMs: 10,
+    };
+}
+
+/** Call this from the client app to enable tracing. Safe to call multiple times. */
+export function initReproTracing(opts?: TracerInitOpts) {
+    if (__TRACER_READY) return __TRACER__;
     try {
         const tracerPkg: TracerApi = require('../tracer');
-
-        const cwd = process.cwd().replace(/\\/g, '/');
-        const sdkRoot = __dirname.replace(/\\/g, '/');
-
-        // include ONLY app code (no node_modules) to avoid interfering with deps
-        const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
-
-        // additionally exclude common model/schema folders to be extra safe
-        const extraExcludes = [
-            '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
-        ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
-
-        // exclude this SDK itself (and any babel internals if present)
-        const exclude = [
-            new RegExp('^' + escapeRx(sdkRoot) + '/'),
-            /node_modules[\\/]@babel[\\/].*/,
-            ...extraExcludes,
-        ];
-
-        tracerPkg.init?.({
-            instrument: true,               // tracer can instrument app code
-            include,
-            exclude,                        // but never our SDK or common data/model paths
-            mode: process.env.TRACE_MODE || 'v8',
-            samplingMs: 10,
-        });
-
+        const initOpts = { ...defaultTracerInitOpts(), ...(opts || {}) };
+        tracerPkg.init?.(initOpts);
         tracerPkg.patchHttp?.();
-
         __TRACER__ = tracerPkg;
         __TRACER_READY = true;
     } catch {
-        __TRACER__ = null; // optional tracer
+        __TRACER__ = null; // SDK still works without tracer
     } finally {
-        // Critical: make sure Mongoose core is pristine after tracer init.
+        // keep Mongoose prototypes pristine in either case
         restoreMongooseIfNeeded();
-        // And again on next tick (if tracer defers some wrapping)
         setImmediate(restoreMongooseIfNeeded);
     }
-})();
-// ===================================================================
+    return __TRACER__;
+}
+
+/** Optional helper if users want to check it. */
+export function isReproTracingEnabled() { return __TRACER_READY; }
 
 type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
