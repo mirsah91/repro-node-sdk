@@ -200,7 +200,9 @@ if (!global.__repro_call) {
                 }
             } catch {
                 // Never blow up the app due to tracing; just fall back to direct call.
-                return fn.apply(thisArg, args);
+                if (fn) {
+                    return fn.apply(thisArg, args);
+                }
             }
         },
         configurable: false,
