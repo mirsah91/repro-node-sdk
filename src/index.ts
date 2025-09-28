@@ -3,12 +3,199 @@ import type { Schema, Model, Query } from 'mongoose';
 import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 
+/**
+ * ============================= IMPORTANT =============================
+ * We snapshot Mongoose core methods BEFORE tracer init, then re-apply them
+ * AFTER tracer init. This guarantees Model.find() still returns a Query and
+ * chainability (e.g., .sort().lean()) is preserved. No behavior changes.
+ * =====================================================================
+ */
+const __ORIG = (() => {
+    const M: any = (mongoose as any).Model;
+    const Qp: any = (mongoose as any).Query?.prototype;
+    const Ap: any = (mongoose as any).Aggregate?.prototype;
+    return {
+        Model: {
+            find: M?.find,
+            findOne: M?.findOne,
+            findById: M?.findById,
+            create: M?.create,
+            insertMany: M?.insertMany,
+            updateOne: M?.updateOne,
+            updateMany: M?.updateMany,
+            replaceOne: M?.replaceOne,
+            deleteOne: M?.deleteOne,
+            deleteMany: M?.deleteMany,
+            countDocuments: M?.countDocuments,
+            estimatedDocumentCount: M?.estimatedDocumentCount,
+            distinct: M?.distinct,
+            findOneAndUpdate: M?.findOneAndUpdate,
+            findOneAndDelete: M?.findOneAndDelete,
+            findOneAndReplace: M?.findOneAndReplace,
+            findOneAndRemove: M?.findOneAndRemove,
+            bulkWrite: M?.bulkWrite,
+        },
+        Query: {
+            exec: Qp?.exec,
+            lean: Qp?.lean,
+            sort: Qp?.sort,
+            select: Qp?.select,
+            limit: Qp?.limit,
+            skip: Qp?.skip,
+            populate: Qp?.populate,
+            getFilter: Qp?.getFilter,
+            getUpdate: Qp?.getUpdate,
+            getOptions: Qp?.getOptions,
+            projection: Qp?.projection,
+        },
+        Aggregate: {
+            exec: Ap?.exec,
+        }
+    };
+})();
+
+function restoreMongooseIfNeeded() {
+    try {
+        const M: any = (mongoose as any).Model;
+        const Qp: any = (mongoose as any).Query?.prototype;
+        const Ap: any = (mongoose as any).Aggregate?.prototype;
+        const safeSet = (obj: any, key: string, val: any) => {
+            if (!obj || !val) return;
+            if (obj[key] !== val) { try { obj[key] = val; } catch {} }
+        };
+
+        // Restore Model methods (chainability depends on these returning Query)
+        Object.entries(__ORIG.Model).forEach(([k, v]) => safeSet(M, k, v));
+
+        // Restore Query prototype essentials (exec/lean/etc.)
+        Object.entries(__ORIG.Query).forEach(([k, v]) => safeSet(Qp, k, v));
+
+        // Restore Aggregate exec
+        Object.entries(__ORIG.Aggregate).forEach(([k, v]) => safeSet(Ap, k, v));
+    } catch {}
+}
+
+// ====== tiny, safe tracer auto-init (no node_modules patches) ======
+type TracerApi = {
+    init?: (opts: any) => void;
+    tracer?: { on: (fn: (ev: any) => void) => () => void };
+    getCurrentTraceId?: () => string | null;
+    patchHttp?: () => void; // optional in your tracer
+};
+
+function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+let __TRACER__: TracerApi | null = null;
+let __TRACER_READY = false;
+
+// (function ensureTracerAutoInit() {
+//     if (__TRACER_READY) return;
+//
+//     try {
+//         const tracerPkg: TracerApi = require('../tracer');
+//
+//         const cwd = process.cwd().replace(/\\/g, '/');
+//         const sdkRoot = __dirname.replace(/\\/g, '/');
+//
+//         // include ONLY app code (no node_modules) to avoid interfering with deps
+//         const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
+//
+//         // additionally exclude common model/schema folders to be extra safe
+//         const extraExcludes = [
+//             '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
+//         ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
+//
+//         // exclude this SDK itself (and any babel internals if present)
+//         const exclude = [
+//             new RegExp('^' + escapeRx(sdkRoot) + '/'),
+//             /node_modules[\\/]@babel[\\/].*/,
+//             ...extraExcludes,
+//         ];
+//
+//         tracerPkg.init?.({
+//             instrument: true,               // tracer can instrument app code
+//             include,
+//             exclude,                        // but never our SDK or common data/model paths
+//             mode: process.env.TRACE_MODE || 'v8',
+//             samplingMs: 10,
+//         });
+//
+//         tracerPkg.patchHttp?.();
+//
+//         __TRACER__ = tracerPkg;
+//         __TRACER_READY = true;
+//     } catch {
+//         __TRACER__ = null; // optional tracer
+//     } finally {
+//         // Critical: make sure Mongoose core is pristine after tracer init.
+//         restoreMongooseIfNeeded();
+//         // And again on next tick (if tracer defers some wrapping)
+//         setImmediate(restoreMongooseIfNeeded);
+//     }
+// })();
+// ===================================================================
+
+// ===== Configurable tracer init (explicit, no auto-run) =====
+type TracerInitOpts = {
+    instrument?: boolean;
+    include?: RegExp[];
+    exclude?: RegExp[];
+    mode?: string;
+    samplingMs?: number;
+};
+
+function defaultTracerInitOpts(): TracerInitOpts {
+    const cwd = process.cwd().replace(/\\/g, '/');
+    const sdkRoot = __dirname.replace(/\\/g, '/');
+    const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
+    const extraExcludes = [
+        '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
+    ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
+
+    const exclude = [
+        new RegExp('^' + escapeRx(sdkRoot) + '/'), // never instrument the SDK itself
+        /node_modules[\\/]@babel[\\/].*/,
+        ...extraExcludes,
+    ];
+
+    return {
+        instrument: true,
+        include,
+        exclude,
+        mode: process.env.TRACE_MODE || 'v8',
+        samplingMs: 10,
+    };
+}
+
+/** Call this from the client app to enable tracing. Safe to call multiple times. */
+export function initReproTracing(opts?: TracerInitOpts) {
+    if (__TRACER_READY) return __TRACER__;
+    try {
+        const tracerPkg: TracerApi = require('../tracer');
+        const initOpts = { ...defaultTracerInitOpts(), ...(opts || {}) };
+        tracerPkg.init?.(initOpts);
+        tracerPkg.patchHttp?.();
+        __TRACER__ = tracerPkg;
+        __TRACER_READY = true;
+    } catch {
+        __TRACER__ = null; // SDK still works without tracer
+    } finally {
+        // keep Mongoose prototypes pristine in either case
+        restoreMongooseIfNeeded();
+        setImmediate(restoreMongooseIfNeeded);
+    }
+    return __TRACER__;
+}
+
+/** Optional helper if users want to check it. */
+export function isReproTracingEnabled() { return __TRACER_READY; }
+
 type Ctx = { sid?: string; aid?: string };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
 function getCollectionNameFromDoc(doc: any): string | undefined {
-    // Prefer internal collection (Mongoose 8)
     const direct =
         doc?.$__?.collection?.collectionName ||
         (doc?.$collection as any)?.collectionName ||
@@ -18,7 +205,6 @@ function getCollectionNameFromDoc(doc: any): string | undefined {
 
     if (direct) return direct;
 
-    // Subdocument? Try ownerDocument()
     if (doc?.$isSubdocument && typeof doc.ownerDocument === 'function') {
         const parent = doc.ownerDocument();
         return (
@@ -30,7 +216,6 @@ function getCollectionNameFromDoc(doc: any): string | undefined {
         );
     }
 
-    // Discriminator child may have baseModelName
     const ctor = doc?.constructor as any;
     if (ctor?.base && ctor?.base?.collection?.collectionName) {
         return ctor.base.collection.collectionName;
@@ -40,10 +225,7 @@ function getCollectionNameFromDoc(doc: any): string | undefined {
 }
 
 function getCollectionNameFromQuery(q: any): string | undefined {
-    return (
-        q?.model?.collection?.collectionName ||
-        (q?.model?.collection as any)?.name
-    );
+    return q?.model?.collection?.collectionName || (q?.model?.collection as any)?.name;
 }
 
 function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
@@ -79,13 +261,11 @@ async function post(apiBase: string, appId: string, appSecret: string, sessionId
 
 // -------- helpers for response capture & grouping --------
 function normalizeRouteKey(method: string, rawPath: string) {
-    // strip query string to stabilize grouping across re-loads
     const base = (rawPath || '/').split('?')[0] || '/';
     return `${String(method || 'GET').toUpperCase()} ${base}`;
 }
 
 function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
-    // If already an object/array, store as-is
     if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
 
     const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
@@ -100,16 +280,14 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
             return isLikelyJson ? JSON.parse(body) : body;
         }
     } catch {
-        // fall through to raw string if JSON parse fails
         if (Buffer.isBuffer(body)) return body.toString('utf8');
         if (typeof body === 'string') return body;
     }
-    // last resort
     return body;
 }
 
 // ===================================================================
-// reproMiddleware — now captures respBody (+ key) and posts both url & path
+// reproMiddleware — unchanged behavior + passive per-request trace
 // ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (req: Request, res: Response, next: NextFunction) {
@@ -119,17 +297,14 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 
         const t0 = Date.now();
         const rid = String(t0);
-        const url = (req as any).originalUrl || req.url || '/'; // send as 'url'
-        const path = url;                                       // keep 'path' for back-compat
+        const url = (req as any).originalUrl || req.url || '/';
+        const path = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
 
-        // ---- Capture response body robustly (json/send/write/end) ----
+        // ---- response body capture (unchanged) ----
         let capturedBody: any = undefined;
         const origJson = res.json.bind(res as any);
-        (res as any).json = (body: any) => {
-            capturedBody = body;
-            return origJson(body);
-        };
+        (res as any).json = (body: any) => { capturedBody = body; return origJson(body); };
 
         const origSend = res.send.bind(res as any);
         (res as any).send = (body: any) => {
@@ -139,23 +314,36 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             return origSend(body);
         };
 
-        // If the handler uses res.write/res.end directly, accumulate chunks
         const origWrite = (res as any).write.bind(res as any);
         const origEnd = (res as any).end.bind(res as any);
         const chunks: Array<Buffer | string> = [];
+        (res as any).write = (chunk: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origWrite(chunk, ...args); };
+        (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
-        (res as any).write = (chunk: any, ...args: any[]) => {
-            try { if (chunk != null) chunks.push(chunk); } catch {}
-            return origWrite(chunk, ...args);
-        };
-        (res as any).end = (chunk?: any, ...args: any[]) => {
-            try { if (chunk != null) chunks.push(chunk); } catch {}
-            return origEnd(chunk, ...args);
-        };
-
+        // ---- our ALS (unchanged) ----
         als.run({ sid, aid }, () => {
+            // subscribe to tracer for this request (passive only)
+            const events: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
+            let unsubscribe: undefined | (() => void);
+
+            try {
+                if (__TRACER__?.tracer?.on) {
+                    const getTid = __TRACER__?.getCurrentTraceId;
+                    const tidNow = getTid ? getTid() : null;
+
+                    if (tidNow) {
+                        unsubscribe = __TRACER__.tracer.on((ev: any) => {
+                            if (ev && ev.traceId === tidNow) {
+                                events.push({
+                                    t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth
+                                });
+                            }
+                        });
+                    }
+                }
+            } catch { /* never break user code */ }
+
             res.on('finish', () => {
-                // If nothing captured via json/send, try assembled chunks
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -163,40 +351,48 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
+                let traceStr = '[]';
+                try { traceStr = JSON.stringify(events); } catch {}
+
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
                         request: {
                             rid,
                             method: req.method,
-                            url,                       // NEW: explicit url (API stores this)
-                            path,                      // kept for backward compat
+                            url,
+                            path,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: {},               // (optional) sanitize & include if desired
-                            key,                       // NEW: e.g. "GET /items"
-                            respBody: capturedBody,    // NEW: JSON if parseable, else string
+                            headers: {},
+                            key,
+                            respBody: capturedBody,
+                            trace: traceStr,
                         },
                         t: Date.now(),
                     }]
                 });
+
+                try { unsubscribe && unsubscribe(); } catch {}
             });
+
             next();
         });
     };
 }
 
 // ===================================================================
-// reproMongoosePlugin — unchanged logic, light polish
+// reproMongoosePlugin — stable + NON-intrusive query logs
+//   - NO prototype monkey-patching of Mongoose
+//   - ONLY schema middleware (pre/post) for specific ops
+//   - keeps your existing doc-diff hooks
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
-        // PRE: save
+        // -------- pre/post save (unchanged) --------
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
-
-            // Skip embedded subdocuments — they don't have their own collection
             if ((this as any).$isSubdocument) return next();
 
             let before: any = null;
@@ -206,7 +402,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     before = await model.findById(this._id).lean().exec();
                 }
             } catch {}
-
             (this as any).__repro_meta = {
                 wasNew: this.isNew,
                 before,
@@ -215,7 +410,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
-        // POST: save
         schema.post('save', { document: true }, function () {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
@@ -226,28 +420,20 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
 
-            // NEW: always emit a query
             const query = meta.wasNew
                 ? { op: 'insertOne', doc: after }
                 : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
-                    actionId: aid!,
-                    db: [{
-                        collection,
-                        pk: { _id: this._id },
-                        before,
-                        after,
-                        op: meta.wasNew ? 'insert' : 'update',
-                        query, // <-- ensure this is present
-                    }],
+                    actionId: (getCtx() as Ctx).aid!,
+                    db: [{ collection, pk: { _id: (this as any)._id }, before, after, op: meta.wasNew ? 'insert' : 'update', query }],
                     t: Date.now(),
                 }]
             });
         });
 
-        // PRE: findOneAndUpdate — capture "before"
+        // -------- findOneAndUpdate capture (unchanged) --------
         schema.pre<Query<any, any>>('findOneAndUpdate', async function (next) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return next();
@@ -261,197 +447,151 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             next();
         });
 
-        // POST: findOneAndUpdate — emit change
         schema.post<Query<any, any>>('findOneAndUpdate', function (res: any) {
             const { sid, aid } = getCtx();
             if (!sid || !aid) return;
 
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
-            const collection =
-                (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-
+            const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
-                    actionId: aid!,
-                    db: [{
-                        collection,
-                        pk: { _id: pk },
-                        before,
-                        after,
-                        op: after && before ? 'update' : after ? 'insert' : 'update',
-                    }],
+                    actionId: (getCtx() as Ctx).aid!,
+                    db: [{ collection, pk: { _id: pk }, before, after, op: after && before ? 'update' : after ? 'insert' : 'update' }],
                     t: Date.now()
                 }]
             });
         });
 
-        // PRE: deleteOne
+        // -------- deleteOne capture (unchanged) --------
         schema.pre<Query<any, any>>('deleteOne', { document: false, query: true }, async function (next) {
             const { sid, aid } = getCtx(); if (!sid || !aid) return next();
             try {
                 const filter = this.getFilter();
                 (this as any).__repro_before = await (this.model as Model<any>).findOne(filter).lean().exec();
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
-                (this as any).__repro_filter = filter; // <-- keep filter
+                (this as any).__repro_filter = filter;
             } catch {}
             next();
         });
 
-        // POST: deleteOne
         schema.post<Query<any, any>>('deleteOne', { document: false, query: true }, function () {
             const { sid, aid } = getCtx(); if (!sid || !aid) return;
             const before = (this as any).__repro_before ?? null;
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-            const filter = (this as any).__repro_filter ?? { _id: before._id }; // fallback
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
+            const filter = (this as any).__repro_filter ?? { _id: before._id };
+            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
-                    actionId: aid!,
-                    db: [{
-                        collection,
-                        pk: { _id: before._id },
-                        before,
-                        after: null,
-                        op: 'delete',
-                        query: { filter },     // <-- add query
-                    }],
+                    actionId: (getCtx() as Ctx).aid!,
+                    db: [{ collection, pk: { _id: before._id }, before, after: null, op: 'delete', query: { filter } }],
                     t: Date.now()
                 }]
             });
         });
 
-        if (!(mongoose as any).__repro_query_patched) {
-            (mongoose as any).__repro_query_patched = true;
+        // -------- NON-intrusive generic query telemetry via schema hooks -------
+        const READ_OPS = [
+            'find',
+            'findOne',
+            'countDocuments',
+            'estimatedDocumentCount',
+            'distinct',
+        ] as const;
 
-            const Q = (mongoose as any).Query?.prototype;
-            const Agg = (mongoose as any).Aggregate?.prototype;
-            const origExec = Q?.exec;
-            const origAggExec = Agg?.exec;
+        const WRITE_OPS = [
+            'updateOne',
+            'updateMany',
+            'replaceOne',
+            'deleteMany',
+            'findOneAndUpdate'
+        ] as const;
 
-            // Patch Query.exec for all model ops (find, findOne, update*, delete*, count*, etc.)
-            if (origExec) {
-                Q.exec = async function patchedExec(this: any, ...args: any[]) {
-                    const { sid, aid } = getCtx();
-                    const t0 = Date.now();
-                    let error: any = null;
+        function attachQueryHooks(op: string) {
+            schema.pre(op as any, function (this: any, next: Function) {
+                try {
+                    (this as any).__repro_qmeta = {
+                        t0: Date.now(),
+                        collection: this?.model?.collection?.name || 'unknown',
+                        op,
+                        filter: safeJson(this.getFilter?.() ?? this._conditions ?? undefined),
+                        update: safeJson(this.getUpdate?.() ?? this._update ?? undefined),
+                        projection: safeJson(this.projection?.() ?? this._fields ?? undefined),
+                        options: safeJson(this.getOptions?.() ?? this.options ?? undefined),
+                    };
+                } catch {
+                    (this as any).__repro_qmeta = { t0: Date.now(), collection: 'unknown', op };
+                }
+                next();
+            });
 
-                    // gather query facts up front
-                    const collection = this?.model?.collection?.name || 'unknown';
-                    const op = String(this?.op || this?.mquery?.op || 'query');
-                    const filter = safeJson(this.getFilter?.() ?? this._conditions ?? undefined);
-                    const update = safeJson(this.getUpdate?.() ?? this._update ?? undefined);
-                    const projection = safeJson(this.projection?.() ?? this._fields ?? undefined);
-                    const options = safeJson(this.getOptions?.() ?? this.options ?? undefined);
+            schema.post(op as any, function (this: any, res: any) {
+                const { sid, aid } = getCtx();
+                if (!sid) return;
 
-                    try {
-                        const res = await origExec.apply(this, args);
-                        // summarize result (don’t serialize large docs)
-                        const resultMeta = summarizeQueryResult(op, res);
-                        if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op,
-                            query: { filter, update, projection, options },
-                            resultMeta,
-                            durMs: Date.now() - t0,
-                            t: Date.now(),
-                        });
-                        return res;
-                    } catch (e: any) {
-                        error = { message: e?.message, code: e?.code };
-                        if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op,
-                            query: { filter, update, projection, options },
-                            resultMeta: undefined,
-                            durMs: Date.now() - t0,
-                            t: Date.now(),
-                            error,
-                        });
-                        throw e;
-                    }
-                };
-            }
+                const meta = (this as any).__repro_qmeta || { t0: Date.now(), collection: 'unknown', op };
+                const resultMeta = summarizeQueryResult(op, res);
 
-            // Patch Aggregate.exec
-            if (origAggExec) {
-                Agg.exec = async function patchedAggExec(this: any, ...args: any[]) {
-                    const { sid, aid } = getCtx();
-                    const t0 = Date.now();
-                    const collection = this?.model?.collection?.name || 'unknown';
-                    const op = 'aggregate';
-                    const pipeline = safeJson(this?.pipeline?.() ?? this?._pipeline ?? this?.pipeline ?? undefined);
-                    try {
-                        const res = await origAggExec.apply(this, args);
-                        const resultMeta = summarizeQueryResult(op, res);
-                        if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op,
-                            query: { pipeline },
-                            resultMeta,
-                            durMs: Date.now() - t0,
-                            t: Date.now(),
-                        });
-                        return res;
-                    } catch (e: any) {
-                        const error = { message: e?.message, code: e?.code };
-                        if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op,
-                            query: { pipeline },
-                            resultMeta: undefined,
-                            durMs: Date.now() - t0,
-                            t: Date.now(),
-                            error,
-                        });
-                        throw e;
-                    }
-                };
-            }
-
-            // Patch Model.bulkWrite
-            const origBulkWrite = (mongoose as any).Model?.bulkWrite;
-            if (origBulkWrite) {
-                (mongoose as any).Model.bulkWrite = async function patchedBulkWrite(this: Model<any>, ops: any[], options?: any) {
-                    const { sid, aid } = getCtx();
-                    const t0 = Date.now();
-                    const collection = (this as any)?.collection?.name || 'unknown';
-                    try {
-                        const res = await origBulkWrite.apply(this, [ops, options]);
-                        const resultMeta = summarizeBulkResult(res);
-                        if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op: 'bulkWrite',
-                            query: { bulk: safeJson(ops), options: safeJson(options) },
-                            resultMeta,
-                            durMs: Date.now() - t0,
-                            t: Date.now(),
-                        });
-                        return res;
-                    } catch (e: any) {
-                        const error = { message: e?.message, code: e?.code };
-                        if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op: 'bulkWrite',
-                            query: { bulk: safeJson(ops), options: safeJson(options) },
-                            resultMeta: undefined,
-                            durMs: Date.now() - t0,
-                            t: Date.now(),
-                            error,
-                        });
-                        throw e;
-                    }
-                };
-            }
+                emitDbQuery(cfg, sid, aid, {
+                    collection: meta.collection,
+                    op,
+                    query: { filter: meta.filter, update: meta.update, projection: meta.projection, options: meta.options },
+                    resultMeta,
+                    durMs: Date.now() - meta.t0,
+                    t: Date.now(),
+                });
+            });
         }
+
+        READ_OPS.forEach(attachQueryHooks);
+        WRITE_OPS.forEach(attachQueryHooks);
+
+        // Aggregate middleware (non-intrusive)
+        schema.pre('aggregate', function (this: any, next: Function) {
+            try {
+                (this as any).__repro_aggmeta = {
+                    t0: Date.now(),
+                    collection:
+                        this?.model?.collection?.name ||
+                        this?._model?.collection?.name ||
+                        (this?.model && this.model.collection?.name) ||
+                        'unknown',
+                    pipeline: safeJson(this.pipeline?.() ?? this._pipeline ?? undefined),
+                };
+            } catch {
+                (this as any).__repro_aggmeta = { t0: Date.now(), collection: 'unknown', pipeline: undefined };
+            }
+            next();
+        });
+
+        schema.post('aggregate', function (this: any, res: any[]) {
+            const { sid, aid } = getCtx();
+            if (!sid) return;
+
+            const meta = (this as any).__repro_aggmeta || { t0: Date.now(), collection: 'unknown' };
+            const resultMeta = summarizeQueryResult('aggregate', res);
+
+            emitDbQuery(cfg, sid, aid, {
+                collection: meta.collection,
+                op: 'aggregate',
+                query: { pipeline: meta.pipeline },
+                resultMeta,
+                durMs: Date.now() - meta.t0,
+                t: Date.now(),
+            });
+        });
     };
 }
 
 function summarizeQueryResult(op: string, res: any) {
-    // reads
     if (op === 'find' || op === 'findOne' || op === 'aggregate' || op.startsWith('count')) {
         if (Array.isArray(res)) return { docsCount: res.length };
-        if (res && typeof res === 'object' && typeof res.toArray === 'function') return { docsCount: undefined };
+        if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') return { docsCount: undefined };
         if (res == null) return { docsCount: 0 };
         return { docsCount: 1 };
     }
-    // writes
     return pickWriteStats(res);
 }
 
@@ -485,11 +625,9 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
             db: [{
                 collection: payload.collection,
                 op: payload.op,
-                // New fields; server will accept them
                 query: payload.query ?? undefined,
                 resultMeta: payload.resultMeta ?? undefined,
                 durMs: payload.durMs ?? undefined,
-                // keep document-diff fields null for pure queries
                 pk: null, before: null, after: null,
                 error: payload.error ?? undefined,
             }],
@@ -498,7 +636,6 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     });
 }
 
-// 1) helper once in your plugin module
 function buildMinimalUpdate(before: any, after: any) {
     const set: Record<string, any> = {};
     const unset: Record<string, any> = {};
@@ -536,7 +673,9 @@ function buildMinimalUpdate(before: any, after: any) {
     return update;
 }
 
-// Sendgrid
+// ===================================================================
+// Sendgrid — unchanged
+// ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
     appSecret: string;
@@ -652,8 +791,8 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
             base.cc = normalizeAddressList(p0.cc) ?? base.cc;
             base.bcc = normalizeAddressList(p0.bcc) ?? base.bcc;
             if (!base.subject && p0.subject) base.subject = String(p0.subject);
-            if (!base.dynamicTemplateData && p0.dynamic_template_data) base.dynamicTemplateData = p0.dynamic_template_data;
-            if (!base.customArgs && p0.custom_args) base.customArgs = p0.custom_args;
+            if (!base.dynamicTemplateData && (p0 as any).dynamic_template_data) base.dynamicTemplateData = (p0 as any).dynamic_template_data;
+            if (!base.customArgs && (p0 as any).custom_args) base.customArgs = (p0 as any).custom_args;
         }
         return base;
     }
@@ -665,4 +804,3 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         return undefined;
     }
 }
-
