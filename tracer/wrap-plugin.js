@@ -12,12 +12,14 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             typeof p === 'string' ? new RegExp(`^${escapeRx(p)}$`) : p
         );
 
-        function escapeRx(s){ return s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&'); }
+        function escapeRx(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
         const obj = kv => t.objectExpression(
             Object.entries(kv).filter(([,v])=>v!=null)
-                .map(([k,v]) => t.objectProperty(t.identifier(k),
-                    typeof v === 'string' ? t.stringLiteral(v) : t.numericLiteral(v)))
+                .map(([k,v]) => t.objectProperty(
+                    t.identifier(k),
+                    typeof v === 'string' ? t.stringLiteral(v) : t.numericLiteral(v)
+                ))
         );
 
         function nameFor(path){
@@ -75,12 +77,16 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (!t.isBlockStatement(body)) return;
 
             const enter = t.expressionStatement(
-                t.callExpression(t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line }) ])
+                t.callExpression(
+                    t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
+                    [ t.stringLiteral(name), obj({ file, line }) ]
+                )
             );
             const exit = t.expressionStatement(
-                t.callExpression(t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
-                    [ obj({ fn: name, file, line }) ])
+                t.callExpression(
+                    t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
+                    [ obj({ fn: name, file, line }) ]
+                )
             );
 
             const wrapped = t.blockStatement([ enter, t.tryStatement(body, null, t.blockStatement([ exit ])) ]);
@@ -90,15 +96,66 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             n.__wrapped = true;
         }
 
+        // ---- NEW: wrap every call-site with __repro_call(...) ----
+        function wrapCall(path, state) {
+            const n = path.node;
+            if (n.__repro_call_wrapped) return;
+
+            // Don’t wrap our own helper, super() or dynamic import()
+            if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
+            if (t.isSuper(n.callee)) return;
+            if (t.isImport(n.callee)) return;
+
+            // Optional chaining calls are tricky to preserve exactly; skip for now
+            // (If needed, we can add a nullish check + temp variables.)
+            if (n.optional === true) return;
+
+            // Determine thisArg and a friendly label (best-effort)
+            let thisArg = t.nullLiteral();
+            let label = null;
+
+            if (t.isMemberExpression(n.callee)) {
+                thisArg = n.callee.object;
+                if (t.isIdentifier(n.callee.property)) {
+                    label = t.stringLiteral(n.callee.property.name);
+                } else if (t.isStringLiteral(n.callee.property)) {
+                    label = t.stringLiteral(n.callee.property.value);
+                }
+            } else if (t.isIdentifier(n.callee)) {
+                label = t.stringLiteral(n.callee.name);
+            }
+
+            const argsArray = t.arrayExpression(n.arguments); // preserves spreads
+            const fileLit = t.stringLiteral(state.file.opts.filename || '');
+            const lineLit = t.numericLiteral(n.loc?.start?.line ?? 0);
+            const labelLit = label || t.stringLiteral('');
+
+            const callShim = t.callExpression(
+                t.identifier('__repro_call'),
+                [ n.callee, thisArg, argsArray, fileLit, lineLit, labelLit ]
+            );
+
+            path.replaceWith(callShim);
+            path.node.__repro_call_wrapped = true;
+        }
+
         return {
-            name: 'omnitrace-wrap-functions',
+            name: 'omnitrace-wrap-functions-and-calls',
             visitor: {
+                // function body enter/exit
                 FunctionDeclaration: wrap,
                 FunctionExpression: wrap,
                 ArrowFunctionExpression: wrap,
                 ObjectMethod: wrap,
                 ClassMethod: wrap,
                 ClassPrivateMethod: wrap,
+
+                // call-site wrapping
+                CallExpression: {
+                    exit(path, state) { wrapCall(path, state); }
+                },
+                // (If you also want to wrap OptionalCallExpression in older Babel ASTs,
+                // add the same handler here)
             }
         };
     };

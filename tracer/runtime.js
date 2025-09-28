@@ -27,7 +27,6 @@ function patchConsole() {
     }
 }
 
-
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
     withTrace(id, fn){ return als.run({ traceId: id, depth: 0 }, fn); },
@@ -45,6 +44,11 @@ const trace = {
     }
 };
 global.__trace = trace; // called by injected code
+
+// ===== Symbols used by the loader to tag function origins =====
+const SYM_SRC_FILE = Symbol.for('__repro_src_file'); // function's defining file (set by require hook)
+const SYM_IS_APP   = Symbol.for('__repro_is_app');   // boolean: true if function is from app code
+const SYM_SKIP_WRAP= Symbol.for('__repro_skip_wrap'); // guard to avoid wrapping our own helpers
 
 function emit(ev){
     if (EMITTING) return;
@@ -157,8 +161,55 @@ if (!quiet) {
     });
 }
 
-
 function short(p){ try{ const cwd = process.cwd().replace(/\\/g,'/'); return String(p).replace(cwd+'/',''); } catch { return p; } }
+
+// ========= Generic call-site shim (used by Babel transform) =========
+// Decides whether to emit a top-level event based on callee origin tags.
+// No hardcoded library names or file paths.
+if (!global.__repro_call) {
+    Object.defineProperty(global, '__repro_call', {
+        value: function __repro_call(fn, thisArg, args, callFile, callLine, label) {
+            try {
+                if (typeof fn !== 'function' || fn[SYM_SKIP_WRAP]) {
+                    return fn.apply(thisArg, args);
+                }
+
+                // Tagged by the require hook (cjs-hook): origin of the callee
+                const isApp = fn[SYM_IS_APP] === true;
+
+                // App functions are traced inside their bodies (via AST); avoid double entries.
+                if (isApp) return fn.apply(thisArg, args);
+
+                // Dependency call: emit single top-level event labeled by name or provided label.
+                const name = label || fn.name || '(anonymous)';
+                const meta = { file: callFile || null, line: callLine || null };
+
+                trace.enter(name, meta);
+                try {
+                    const out = fn.apply(thisArg, args);
+                    if (out && typeof out.then === 'function' && typeof out.finally === 'function') {
+                        return out.finally(() =>
+                            trace.exit({ fn: name, file: meta.file, line: meta.line })
+                        );
+                    }
+                    trace.exit({ fn: name, file: meta.file, line: meta.line });
+                    return out;
+                } catch (e) {
+                    trace.exit({ fn: name, file: meta.file, line: meta.line });
+                    throw e;
+                }
+            } catch {
+                // Never blow up the app due to tracing; just fall back to direct call.
+                return fn.apply(thisArg, args);
+            }
+        },
+        configurable: false,
+        writable: false,
+        enumerable: false
+    });
+    // Guard our helper from any instrumentation
+    global.__repro_call[SYM_SKIP_WRAP] = true;
+}
 
 // ---- automatic per-request context via http/https ----
 function patchHttp(){
@@ -227,5 +278,9 @@ module.exports = {
     startV8,
     printV8,
     patchConsole,
-    getCurrentTraceId
+    getCurrentTraceId,
+    // export symbols so the require hook can tag function origins
+    SYM_SRC_FILE,
+    SYM_IS_APP,
+    SYM_SKIP_WRAP
 };
