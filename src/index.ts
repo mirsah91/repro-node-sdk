@@ -440,12 +440,12 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 }
 
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
-    // --- tracer API (prefer the bundled tracer; fallback to global __trace) ---
+    // --- tracer API (prefer bundled tracer; fallback to global __trace) ---
     const tracerApi: any = (() => {
         try { return require('./tracer').tracer; } catch { return (global as any).__trace; }
     })();
 
-    // resolve "node_modules/mongoose/..." file paths so runtime filter treats these as dep top-level calls
+    // label events as dependency calls so your runtime prints only top-level for deps
     const modelFile = (() => {
         try { return path.join(path.dirname(require.resolve('mongoose/package.json')), 'lib', 'model.js').replace(/\\/g, '/'); }
         catch { return 'node_modules/mongoose/lib/model.js'; }
@@ -463,42 +463,69 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
     const exit  = (name: string, file: string) => { try { tracerApi?.exit?.({ fn: name, file, line: null }); } catch {} };
 
     // -----------------------------------------------------------------------
-    // Global, one-time top-level method patches (create/bulkWrite, etc.)
+    // Global, one-time: patch common Model methods to emit top-level tracer events
     // -----------------------------------------------------------------------
     if (!(mongoose as any).__repro_model_calllog_patched) {
         (mongoose as any).__repro_model_calllog_patched = true;
 
         const S = Symbol.for('__repro_top_patch_guard');
+        const M = (mongoose as any).Model;
 
-        // helper to patch async static methods on Model
-        const wrapModelAsyncTop = (obj: any, name: string) => {
-            const orig = obj?.[name];
-            if (typeof orig !== 'function' || (orig as any)?.[S]) return;
-            const wrapped = async function patchedTopLevel(this: Model<any>, ...args: any[]) {
+        const wrapModelTop = (name: string) => {
+            const orig = M?.[name];
+            if (!orig || typeof orig !== 'function' || (orig as any)[S]) return;
+
+            const wrapped = function patchedModelTop(this: Model<any>, ...args: any[]) {
                 enter(name, modelFile);
-                try { return await orig.apply(this, args as any); }
-                finally { exit(name, modelFile); }
+                try {
+                    const ret = orig.apply(this, args as any);
+                    // if it’s thenable (Query or Promise), exit on settle; otherwise exit now
+                    if (ret && typeof (ret as any).then === 'function' && typeof (ret as any).finally === 'function') {
+                        return (ret as any).finally(() => exit(name, modelFile));
+                    }
+                    exit(name, modelFile);
+                    return ret;
+                } catch (e) {
+                    exit(name, modelFile);
+                    throw e;
+                }
             };
             (wrapped as any)[S] = true;
-            obj[name] = wrapped;
+            M[name] = wrapped;
         };
 
-        // MUST-HAVE: create
-        if ((mongoose as any).Model) {
-            wrapModelAsyncTop((mongoose as any).Model, 'create');
-            // Add more as needed:
-            // wrapModelAsyncTop((mongoose as any).Model, 'insertMany');
-            // wrapModelAsyncTop((mongoose as any).Model, 'deleteMany');
-            // wrapModelAsyncTop((mongoose as any).Model, 'updateOne');
-            // wrapModelAsyncTop((mongoose as any).Model, 'updateMany');
+        if (M) {
+            // CRUD & read methods commonly used in apps
+            [
+                'create',
+                'insertMany',
+                'deleteOne',
+                'deleteMany',
+                'updateOne',
+                'updateMany',
+                'replaceOne',
+                'find',
+                'findOne',
+                'findById',
+                'countDocuments',
+                'estimatedDocumentCount',
+                'distinct',
+                // keep bulkWrite below (we patch it later to also emit DB meta)
+                // 'bulkWrite',
+                // findOneAnd* return Queries too; add if you want the top call name visible:
+                'findOneAndUpdate',
+                'findOneAndDelete',
+                'findOneAndReplace',
+                'findOneAndRemove',
+            ].forEach(wrapModelTop);
         }
     }
 
     // -----------------------------------------------------------------------
-    // Per-schema hooks (your existing logic) + query/aggregate exec patches
+    // Per-schema hooks (your existing logic) + query/aggregate/bulkwrite patches
     // -----------------------------------------------------------------------
     return function (schema: Schema) {
-        // -------- pre/post save (unchanged, except kept as-is) --------
+        // -------- pre/post save (unchanged) --------
         schema.pre('save', { document: true }, async function (next) {
             const { sid, aid } = getCtx() as Ctx;
             if (!sid || !aid) return next();
@@ -597,7 +624,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-        // -------- query/aggregate/bulkwrite top-level tracer events + your capture --------
+        // -------- Query/Aggregate exec — tracer top-level + your DB capture --------
         if (!(mongoose as any).__repro_query_patched) {
             (mongoose as any).__repro_query_patched = true;
 
@@ -617,7 +644,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const projection = safeJson(this.projection?.() ?? this._fields ?? undefined);
                     const options = safeJson(this.getOptions?.() ?? this.options ?? undefined);
 
-                    // TRACER: show one top-level dep call "exec"
                     enter('exec', queryFile);
                     try {
                         const res = await origExec.apply(this, args);
@@ -641,7 +667,6 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const op = 'aggregate';
                     const pipeline = safeJson(this?.pipeline?.() ?? this?._pipeline ?? this?.pipeline ?? undefined);
 
-                    // TRACER: show one top-level dep call "exec"
                     enter('exec', aggFile);
                     try {
                         const res = await origAggExec.apply(this, args);
@@ -657,14 +682,14 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 };
             }
 
+            // bulkWrite: keep DB meta and tracer
             const origBulkWrite = (mongoose as any).Model?.bulkWrite;
-            if (origBulkWrite) {
+            if (origBulkWrite && !(origBulkWrite as any)[Symbol.for('__repro_top_patch_guard')]) {
                 (mongoose as any).Model.bulkWrite = async function patchedBulkWrite(this: Model<any>, ops: any[], options?: any) {
                     const { sid, aid } = getCtx() as Ctx;
                     const t0 = Date.now();
                     const collection = (this as any)?.collection?.name || 'unknown';
 
-                    // TRACER: show one top-level dep call "bulkWrite"
                     enter('bulkWrite', modelFile);
                     try {
                         const res = await origBulkWrite.apply(this, [ops, options]);
@@ -678,6 +703,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         exit('bulkWrite', modelFile);
                     }
                 };
+                ((mongoose as any).Model.bulkWrite as any)[Symbol.for('__repro_top_patch_guard')] = true;
             }
         }
     };
