@@ -22,39 +22,39 @@ function safeResolveDir(mod: string): string | null {
 let __TRACER_READY = false;
 let tracerPkg: TracerApi;
 
-// (function ensureTracerInstalledOnce() {
-//     if (__TRACER_READY) return;
-//
-//     // require your bundled tracer (folder in this package root)
-//     tracerPkg = require('../tracer') as TracerApi;
-//
-//     const cwd = process.cwd().replace(/\\/g, '/');
-//     const sdkRoot = __dirname.replace(/\\/g, '/');
-//
-//     // instrument: app code (exclude its node_modules), + targeted deps
-//     const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
-//     const expressDir = safeResolveDir('express');
-//     const mongooseDir = safeResolveDir('mongoose');
-//
-//     const include: RegExp[] = [ projectNoNodeModules ];
-//     if (expressDir)  include.push(new RegExp('^' + escapeRx(expressDir)  + '/'));
-//
-//     const exclude: RegExp[] = [
-//         new RegExp('^' + escapeRx(sdkRoot) + '/'),     // don't instrument the SDK itself
-//         /node_modules[\\/]@babel[\\/].*/,              // never touch Babel internals
-//     ];
-//
-//     // start tracer (idempotent inside tracer)
-//     tracerPkg.init({
-//         instrument: true,
-//         mode: process.env.TRACE_MODE || 'v8',
-//         samplingMs: 10,
-//         include,
-//         exclude,
-//     });
-//
-//     __TRACER_READY = true;
-// })();
+(function ensureTracerInstalledOnce() {
+    if (__TRACER_READY) return;
+
+    // require your bundled tracer (folder in this package root)
+    tracerPkg = require('../tracer') as TracerApi;
+
+    const cwd = process.cwd().replace(/\\/g, '/');
+    const sdkRoot = __dirname.replace(/\\/g, '/');
+
+    // instrument: app code (exclude its node_modules), + targeted deps
+    const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
+    const expressDir = safeResolveDir('express');
+    const mongooseDir = safeResolveDir('mongoose');
+
+    const include: RegExp[] = [ projectNoNodeModules ];
+    if (expressDir)  include.push(new RegExp('^' + escapeRx(expressDir)  + '/'));
+
+    const exclude: RegExp[] = [
+        new RegExp('^' + escapeRx(sdkRoot) + '/'),     // don't instrument the SDK itself
+        /node_modules[\\/]@babel[\\/].*/,              // never touch Babel internals
+    ];
+
+    // start tracer (idempotent inside tracer)
+    tracerPkg.init({
+        instrument: true,
+        mode: process.env.TRACE_MODE || 'v8',
+        samplingMs: 10,
+        include,
+        exclude,
+    });
+
+    __TRACER_READY = true;
+})();
 
 type CallEvent = { name: string; t: number; phase: 'enter' | 'exit' };
 type Ctx = { sid?: string; aid?: string; calls?: CallEvent[] };
@@ -337,20 +337,20 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         // Keep sid/aid in our ALS (independent of tracer’s ALS)
         als.run({ sid, aid, calls: [] }, () => {
             // Subscribe to tracer events for THIS request's traceId
-            // const curTid: string | null = typeof tracerPkg.getCurrentTraceId === 'function'
-            //     ? tracerPkg.getCurrentTraceId()
-            //     : null;
-            //
-            // const eventBuf: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
-            // let unsubscribe: undefined | (() => void);
-            //
-            // if (curTid && tracerPkg.tracer && typeof tracerPkg.tracer.on === 'function') {
-            //     unsubscribe = tracerPkg.tracer.on((ev: any) => {
-            //         if (ev && ev.traceId === curTid) {
-            //             eventBuf.push({ t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth });
-            //         }
-            //     });
-            // }
+            const curTid: string | null = typeof tracerPkg.getCurrentTraceId === 'function'
+                ? tracerPkg.getCurrentTraceId()
+                : null;
+
+            const eventBuf: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
+            let unsubscribe: undefined | (() => void);
+
+            if (curTid && tracerPkg.tracer && typeof tracerPkg.tracer.on === 'function') {
+                unsubscribe = tracerPkg.tracer.on((ev: any) => {
+                    if (ev && ev.traceId === curTid) {
+                        eventBuf.push({ t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth });
+                    }
+                });
+            }
 
             res.on('finish', () => {
                 if (capturedBody === undefined && chunks.length) {
@@ -361,11 +361,11 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                 }
 
                 // Compact sequence (optional)
-                // const sequence = eventBuf.filter(e => e.type === 'enter').map(e => e.fn || '');
+                const sequence = eventBuf.filter(e => e.type === 'enter').map(e => e.fn || '');
 
                 // REQUIRED: send full trace as STRING
-                // let traceStr = '[]';
-                // try { traceStr = JSON.stringify(eventBuf); } catch {}
+                let traceStr = '[]';
+                try { traceStr = JSON.stringify(eventBuf); } catch {}
 
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
@@ -380,13 +380,13 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             headers: {},
                             key,
                             respBody: capturedBody,
-                            // trace: traceStr,   // <— the tracer data as a STRING
+                            trace: traceStr,   // <— the tracer data as a STRING
                         },
                         t: Date.now(),
                     }]
                 });
 
-                // try { unsubscribe && unsubscribe(); } catch {}
+                try { unsubscribe && unsubscribe(); } catch {}
             });
 
             next();
