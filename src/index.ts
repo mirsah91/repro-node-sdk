@@ -5,44 +5,34 @@ import * as mongoose from 'mongoose';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
 
-// ---- tracer auto-init (observe-only; no patches/wrapping) -------------------
+// ---- tracer auto-init (observe-only; no wrapping of app/dep code) ----------
 type TracerApi = {
     init?: (opts: any) => any;
-    tracer?: { on: (fn: (ev: any) => void) => () => void };
-    getCurrentTraceId?: () => string | null;
     patchHttp?: () => void; // optional
 };
-
 function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function safeResolveDir(mod: string): string | null {
     try { return path.dirname(require.resolve(mod + '/package.json')).replace(/\\/g, '/'); }
     catch { return null; }
 }
-
 let __TRACER_READY = false;
-let tracerPkg: TracerApi | null = null;
-
 (function ensureTracerInstalledOnce() {
     if (__TRACER_READY) return;
-
     try {
-        tracerPkg = require('../tracer') as TracerApi;
-
+        const tracerPkg = require('../tracer') as TracerApi;
         const cwd = process.cwd().replace(/\\/g, '/');
         const sdkRoot = __dirname.replace(/\\/g, '/');
-
         const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
         const expressDir = safeResolveDir('express');
 
         const include: RegExp[] = [ projectNoNodeModules ];
         if (expressDir) include.push(new RegExp('^' + escapeRx(expressDir) + '/'));
-
         const exclude: RegExp[] = [
             new RegExp('^' + escapeRx(sdkRoot) + '/'),
             /node_modules[\\/]@babel[\\/].*/,
         ];
 
-        // Observe-only: do not inject/transform/wrap anything
+        // IMPORTANT: do NOT wrap/transform user code. Keep observe-only.
         tracerPkg.init?.({
             instrument: false,
             mode: process.env.TRACE_MODE || 'v8',
@@ -51,44 +41,25 @@ let tracerPkg: TracerApi | null = null;
             exclude,
         });
 
-        // Ensure per-request traceId exists (harmless if tracer already did this)
+        // harmless if tracer doesn’t implement it
         tracerPkg.patchHttp?.();
-
-        __TRACER_READY = true;
     } catch {
-        tracerPkg = null; // tracer optional
+        // tracer optional — continue silently if not found
     }
+    __TRACER_READY = true;
 })();
 
-// ---- app ALS context --------------------------------------------------------
-type Ctx = { sid?: string; aid?: string };
+// ---- per-request context & passive trace store ------------------------------
+type Ctx = { sid?: string; aid?: string; traceEvents?: any[] };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
-
-// ---- (NO-OP) express/console/source instrumentation stubs -------------------
-let EXPRESS_PATCHED = false;
-function patchExpressOnce() {
-    if (EXPRESS_PATCHED) return;
-    EXPRESS_PATCHED = true;
-    // Intentionally empty: no wrapping of handlers to avoid behavior changes.
+function pushTrace(kind: string, data: any) {
+    try {
+        const store = als.getStore() as Ctx | undefined;
+        if (!store || !store.traceEvents) return;
+        store.traceEvents.push({ t: Date.now(), kind, ...data });
+    } catch {}
 }
-patchExpressOnce();
-
-let CONSOLE_PATCHED = false;
-function patchConsoleOnce() {
-    if (CONSOLE_PATCHED) return;
-    CONSOLE_PATCHED = true;
-    // Intentionally empty: do not wrap console.* (avoid confusing output).
-}
-patchConsoleOnce();
-
-let TRACE_INSTALLED = false;
-function installFunctionTracerOnce() {
-    if (TRACE_INSTALLED) return;
-    TRACE_INSTALLED = true;
-    // Intentionally empty: no pirates/Babel transforms.
-}
-installFunctionTracerOnce();
 
 // ===================================================================
 // http post helper
@@ -238,7 +209,12 @@ function buildMinimalUpdate(before: any, after: any) {
 }
 
 // ===================================================================
-// reproMiddleware — unchanged behavior + passive per-request trace
+/* reproMiddleware — unchanged behavior + passive per-request trace   *
+ * We DO NOT wrap handlers; we only:
+ *  - capture response body (your existing logic)
+ *  - record request start/end into ALS.traceEvents
+ *  - ship ALS.traceEvents as request.trace (JSON string)
+ */
 // ===================================================================
 export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (req: Request, res: Response, next: NextFunction) {
@@ -249,46 +225,27 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         const t0 = Date.now();
         const rid = String(t0);
         const url = (req as any).originalUrl || req.url || '/';
-        const path = url; // back-compat
+        const pathStr = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
 
         // ---- response body capture (unchanged) ----
         let capturedBody: any = undefined;
         const origJson = res.json.bind(res as any);
         (res as any).json = (body: any) => { capturedBody = body; return origJson(body); };
-
         const origSend = res.send.bind(res as any);
         (res as any).send = (body: any) => {
-            if (capturedBody === undefined) {
-                capturedBody = coerceBodyToStorable(body, res.getHeader?.('content-type'));
-            }
+            if (capturedBody === undefined) capturedBody = coerceBodyToStorable(body, res.getHeader?.('content-type'));
             return origSend(body);
         };
-
         const origWrite = (res as any).write.bind(res as any);
         const origEnd = (res as any).end.bind(res as any);
         const chunks: Array<Buffer | string> = [];
         (res as any).write = (chunk: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origWrite(chunk, ...args); };
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
-        // ---- our ALS (unchanged) ----
-        als.run({ sid, aid }, () => {
-            // -------- passive: subscribe to tracer for this request (if available) --------
-            const events: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
-            let unsubscribe: undefined | (() => void);
-
-            try {
-                if (tracerPkg?.tracer?.on) {
-                    const tidNow = tracerPkg?.getCurrentTraceId?.() ?? null;
-                    if (tidNow) {
-                        unsubscribe = tracerPkg.tracer.on((ev: any) => {
-                            if (ev && ev.traceId === tidNow) {
-                                events.push({ t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth });
-                            }
-                        });
-                    }
-                }
-            } catch { /* never break user code */ }
+        // ---- our ALS (unchanged, now with traceEvents) ----
+        als.run({ sid, aid, traceEvents: [] }, () => {
+            pushTrace('request:start', { rid, method: req.method, url, key });
 
             res.on('finish', () => {
                 if (capturedBody === undefined && chunks.length) {
@@ -298,8 +255,15 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
+                pushTrace('request:finish', { rid, status: res.statusCode, durMs: Date.now() - t0 });
+
+                // take snapshot of this request's trace
                 let traceStr = '[]';
-                try { traceStr = JSON.stringify(events); } catch {}
+                try {
+                    const store = als.getStore() as Ctx | undefined;
+                    const evts = store?.traceEvents ?? [];
+                    traceStr = JSON.stringify(evts);
+                } catch {}
 
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
@@ -308,19 +272,17 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             rid,
                             method: req.method,
                             url,
-                            path,
+                            path: pathStr,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
                             headers: {},
                             key,
                             respBody: capturedBody,
-                            trace: traceStr,  // tracer data as string (may be empty if no events)
+                            trace: traceStr,  // per-request passive trace (JSON string)
                         },
                         t: Date.now(),
                     }]
                 });
-
-                try { unsubscribe && unsubscribe(); } catch {}
             });
 
             next();
@@ -329,7 +291,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 }
 
 // ===================================================================
-// reproMongoosePlugin — stable behavior (no Model/Query wrapping aside from exec)
+// reproMongoosePlugin — stable behavior; adds *trace events* only
 // ===================================================================
 export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
@@ -370,6 +332,9 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 ? { op: 'insertOne', doc: after }
                 : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
+            // trace (passive)
+            pushTrace('mongoose:save', { collection, wasNew: !!meta.wasNew });
+
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
@@ -408,8 +373,10 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-
             const pk = after?._id ?? before?._id;
+
+            // trace (passive)
+            pushTrace('mongoose:findOneAndUpdate', { collection, hasBefore: !!before, hasAfter: !!after });
 
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
@@ -445,6 +412,10 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const filter = (this as any).__repro_filter ?? { _id: before._id };
+
+            // trace (passive)
+            pushTrace('mongoose:deleteOne', { collection });
+
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid!, {
                 entries: [{
                     actionId: aid!,
@@ -461,7 +432,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             });
         });
 
-        // Query / Aggregate exec & Model.bulkWrite — stable patches (telemetry only)
+        // ---- Query/Aggregate exec and Model.bulkWrite: telemetry + trace events ---
         if (!(mongoose as any).__repro_query_patched) {
             (mongoose as any).__repro_query_patched = true;
 
@@ -482,9 +453,16 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const projection = safeJson(this.projection?.() ?? this._fields ?? undefined);
                     const options = safeJson(this.getOptions?.() ?? this.options ?? undefined);
 
+                    // trace (passive)
+                    pushTrace('mongoose:exec:start', { collection, op });
+
                     try {
                         const res = await origExec.apply(this, args);
                         const resultMeta = summarizeQueryResult(op, res);
+
+                        // trace (end)
+                        pushTrace('mongoose:exec:finish', { collection, op, durMs: Date.now() - t0, resultMeta });
+
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op,
                             query: { filter, update, projection, options },
@@ -492,6 +470,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         });
                         return res;
                     } catch (e: any) {
+                        pushTrace('mongoose:exec:error', { collection, op, durMs: Date.now() - t0, error: { message: e?.message, code: e?.code } });
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op,
                             query: { filter, update, projection, options },
@@ -510,19 +489,24 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const collection = this?.model?.collection?.name || 'unknown';
                     const op = 'aggregate';
                     const pipeline = safeJson(this?.pipeline?.() ?? this?._pipeline ?? this?.pipeline ?? undefined);
+
+                    pushTrace('mongoose:aggregate:start', { collection });
+
                     try {
                         const res = await origAggExec.apply(this, args);
                         const resultMeta = summarizeQueryResult(op, res);
+
+                        pushTrace('mongoose:aggregate:finish', { collection, durMs: Date.now() - t0, resultMeta });
+
                         if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op,
-                            query: { pipeline },
+                            collection, op, query: { pipeline },
                             resultMeta, durMs: Date.now() - t0, t: Date.now(),
                         });
                         return res;
                     } catch (e: any) {
+                        pushTrace('mongoose:aggregate:error', { collection, durMs: Date.now() - t0, error: { message: e?.message, code: e?.code } });
                         if (sid) emitDbQuery(cfg, sid, aid, {
-                            collection, op,
-                            query: { pipeline },
+                            collection, op, query: { pipeline },
                             resultMeta: undefined, durMs: Date.now() - t0, t: Date.now(),
                             error: { message: e?.message, code: e?.code },
                         });
@@ -537,9 +521,15 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     const { sid, aid } = getCtx();
                     const t0 = Date.now();
                     const collection = (this as any)?.collection?.name || 'unknown';
+
+                    pushTrace('mongoose:bulkWrite:start', { collection });
+
                     try {
                         const res = await origBulkWrite.apply(this, [ops, options]);
                         const resultMeta = summarizeBulkResult(res);
+
+                        pushTrace('mongoose:bulkWrite:finish', { collection, durMs: Date.now() - t0, resultMeta });
+
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op: 'bulkWrite',
                             query: { bulk: safeJson(ops), options: safeJson(options) },
@@ -547,6 +537,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                         });
                         return res;
                     } catch (e: any) {
+                        pushTrace('mongoose:bulkWrite:error', { collection, durMs: Date.now() - t0, error: { message: e?.message, code: e?.code } });
                         if (sid) emitDbQuery(cfg, sid, aid, {
                             collection, op: 'bulkWrite',
                             query: { bulk: safeJson(ops), options: safeJson(options) },
@@ -562,7 +553,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 }
 
 // ===================================================================
-// SendGrid patch (unchanged)
+// SendGrid patch (unchanged behavior; adds a trace event only)
 // ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
@@ -583,15 +574,31 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
     if (origSend) {
         sgMail.send = async function patchedSend(msg: any, isMultiple?: boolean) {
             const t0 = Date.now(); let statusCode: number | undefined; let headers: Record<string, any> | undefined;
-            try { const res = await origSend(msg, isMultiple); const r = Array.isArray(res) ? res[0] : res; statusCode = r?.statusCode ?? r?.status; headers = r?.headers ?? undefined; return res; }
-            finally { fireCapture('send', msg, t0, statusCode, headers); }
+            try {
+                const res = await origSend(msg, isMultiple);
+                const r = Array.isArray(res) ? res[0] : res;
+                statusCode = r?.statusCode ?? r?.status;
+                headers = r?.headers ?? undefined;
+                return res;
+            } finally {
+                pushTrace('sendgrid:send', { durMs: Date.now() - t0, statusCode });
+                fireCapture('send', msg, t0, statusCode, headers);
+            }
         };
     }
     if (origSendMultiple) {
         sgMail.sendMultiple = async function patchedSendMultiple(msg: any) {
             const t0 = Date.now(); let statusCode: number | undefined; let headers: Record<string, any> | undefined;
-            try { const res = await origSendMultiple(msg); const r = Array.isArray(res) ? res[0] : res; statusCode = r?.statusCode ?? r?.status; headers = r?.headers ?? undefined; return res; }
-            finally { fireCapture('sendMultiple', msg, t0, statusCode, headers); }
+            try {
+                const res = await origSendMultiple(msg);
+                const r = Array.isArray(res) ? res[0] : res;
+                statusCode = r?.statusCode ?? r?.status;
+                headers = r?.headers ?? undefined;
+                return res;
+            } finally {
+                pushTrace('sendgrid:sendMultiple', { durMs: Date.now() - t0, statusCode });
+                fireCapture('sendMultiple', msg, t0, statusCode, headers);
+            }
         };
     }
 
